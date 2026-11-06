@@ -325,8 +325,12 @@ struct ContentView: View {
             }
             hidCapture.onVoiceSessionEnd = { [weak bluetooth, weak actionRunner] in
                 actionRunner?.endVoiceShortcutHold()
-                bluetooth?.stopCurrentVoiceSession()
-                bluetooth?.virtualMicrophone.finishVoiceInputWindow()
+                // The initial working version left ATVV stream lifetime to
+                // AUDIO_STOP, not to a mirrored HID/diagnostic callback.
+                // Calling stopCurrentVoiceSession here creates a feedback
+                // loop: an ATVV close invokes this callback, which closes it
+                // again and can pre-empt incoming PCM.
+                bluetooth?.virtualMicrophone.scheduleVoiceInputRestoration()
             }
             hidCapture.longPressThresholdForKey = { [weak mappingStore] key in
                 mappingStore?.binding(for: key).effectiveThreshold ?? 0.65

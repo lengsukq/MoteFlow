@@ -21,6 +21,29 @@ enum ATVV {
     static func extendMicrophone() -> Data { Data([0x0E, 0x00]) }
 }
 
+/// ATVV's notify subscription is a transport prerequisite, not microphone
+/// capture. The remote must see audio + control notifications enabled before
+/// it can negotiate or accept MIC_OPEN. Only MIC_OPEN/AUDIO_START consume the
+/// remote's voice stream and start feeding PCM to an audio output device.
+enum ATVVTransportPolicy {
+    static func mustKeepAudioNotificationsReady(voiceModeEnabled: Bool) -> Bool {
+        voiceModeEnabled
+    }
+
+    static func canNegotiate(audioSubscribed: Bool, controlSubscribed: Bool) -> Bool {
+        audioSubscribed && controlSubscribed
+    }
+
+    static func shouldEndOnStop(
+        isRecording: Bool, openingMic: Bool, hasPendingSearch: Bool
+    ) -> Bool {
+        // Some remotes send a stale AUDIO_STOP while MIC_OPEN is pending.
+        // Treat only an established stream as stoppable by an ATVV 0x00.
+        // Actual key-up via HID can still cancel a pending mic open.
+        isRecording
+    }
+}
+
 /// Stateless packet converter for the 8/16 kHz mono ADPCM-decoded speech
 /// samples to the 48 kHz, two-channel PCM input expected by BlackHole 2ch.
 /// Kept in ATVVCore so audio conversion is testable without macOS hardware.

@@ -247,6 +247,33 @@ struct RemoteVoicePage: View {
                         VStack(spacing: 10) { audioMetrics }
                     }
 
+                    VStack(alignment: .leading, spacing: 7) {
+                        Label("语音链路诊断（来自实际音频数据）", systemImage: "stethoscope")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text(pipelineDiagnostic)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 14) {
+                            Label("PCM 入队 \(bluetooth.virtualMicrophone.forwardedFrames / 48_000) 秒",
+                                  systemImage: "waveform")
+                            Label(bluetooth.virtualMicrophone.outputStarted ? "CoreAudio 已启动" :
+                                    bluetooth.virtualMicrophone.isRouting ? "等待 CoreAudio 启动" :
+                                    bluetooth.virtualMicrophone.lastSessionOutputStarted ?
+                                        "上次 CoreAudio 已启动" : "上次输出未启动",
+                                  systemImage: "speaker.wave.2")
+                        }
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        Text("系统输入：\(bluetooth.virtualMicrophone.systemInputName) · \(bluetooth.virtualMicrophone.status)")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RemotePalette.indigo.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+
                     HStack(alignment: .center, spacing: 9) {
                         Image(systemName: "info.circle")
                             .foregroundStyle(RemotePalette.indigo)
@@ -400,6 +427,37 @@ struct RemoteVoicePage: View {
             .help(bluetooth.canEnableVoiceMode ? "切换 ATVV 语音通知" : "请先在设备总览中连接支持 ATVV 的遥控器")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var pipelineDiagnostic: String {
+        let router = bluetooth.virtualMicrophone
+        if !bluetooth.voiceModeEnabled {
+            return "ATVV 尚未启用；请先连接遥控器并开启语音键监听。"
+        }
+        if bluetooth.audioChannelActive && !bluetooth.isRecording {
+            return "语音键请求已触发，等待 AUDIO_START。请在连接诊断中查找 MIC_OPEN / CAPS_RESP。"
+        }
+        if bluetooth.isRecording && bluetooth.audioPacketCount == 0 {
+            return "已收到 AUDIO_START，但还没有音频通知。请检查遥控器 → CoreBluetooth 链路。"
+        }
+        if bluetooth.audioPacketCount > 0 && bluetooth.decodedFrameCount == 0 {
+            return "蓝牙音频已收到，但 PCM 解码未成功。请核对 ATVV 版本、SYNC 与帧尺寸。"
+        }
+        if bluetooth.decodedFrameCount > 0 && router.forwardedFrames == 0 {
+            return "PCM 解码成功，但尚未写入虚拟麦克风。请检查路由开关和 BlackHole 状态。"
+        }
+        if router.forwardedFrames > 0 &&
+           !router.outputStarted && !router.lastSessionOutputStarted {
+            return "PCM 已进入输出队列，但本次 CoreAudio 未成功启动；请检查 100ms 预缓冲或输出报错。"
+        }
+        if router.forwardedFrames > 0 && !router.selectedIsDefaultInput &&
+           router.autoSwitchInputForVoice && bluetooth.isRecording {
+            return "PCM 已提交至 BlackHole，但系统输入未切到该设备。请检查输入切换。"
+        }
+        if router.forwardedFrames > 0 {
+            return "已提交 PCM 到 BlackHole 输出队列。若豆包仍无声音，需验证该队列播放及豆包是否真正采集该输入，不能仅凭入队认定音频已送达。"
+        }
+        return "待机中。按住语音键后观察音频通知、解码块和虚拟输出是否依次增加。"
     }
 
     @ViewBuilder

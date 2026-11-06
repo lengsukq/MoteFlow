@@ -16,6 +16,35 @@ final class RemoteMappingTests: XCTestCase {
         XCTAssertEqual(shortcut.display, "⌘⇧K")
     }
 
+    func testInitialCommitATVVCommandFramesRemainCompatible() {
+        XCTAssertEqual(ATVV.getCapabilities, Data([0x0A, 0x01, 0x00, 0x00, 0x03, 0x03]))
+        XCTAssertEqual(ATVV.micOpen(codec: 0x0001), Data([0x0C, 0x00, 0x01]))
+        XCTAssertEqual(ATVV.micOpen(codec: 0x0002), Data([0x0C, 0x00, 0x02]))
+        XCTAssertEqual(ATVV.micClose, Data([0x0D]))
+    }
+
+    func testATVVIdleKeepsPassiveNotificationsButNeverStartsMic() {
+        XCTAssertTrue(ATVVTransportPolicy.mustKeepAudioNotificationsReady(voiceModeEnabled: true))
+        XCTAssertFalse(ATVVTransportPolicy.mustKeepAudioNotificationsReady(voiceModeEnabled: false))
+        XCTAssertFalse(ATVVTransportPolicy.canNegotiate(audioSubscribed: false, controlSubscribed: true))
+        XCTAssertFalse(ATVVTransportPolicy.canNegotiate(audioSubscribed: true, controlSubscribed: false))
+        XCTAssertTrue(ATVVTransportPolicy.canNegotiate(audioSubscribed: true, controlSubscribed: true))
+    }
+
+    func testATVVStaleStopDoesNotInstantlyEndFirstMicrophonePress() {
+        // A stale 0x00 may arrive after START_SEARCH but before AUDIO_START,
+        // or while MIC_OPEN is still being acknowledged. Neither should kill
+        // the synthetic Doubao hold on the first press.
+        XCTAssertFalse(ATVVTransportPolicy.shouldEndOnStop(
+            isRecording: false, openingMic: false, hasPendingSearch: false))
+        XCTAssertFalse(ATVVTransportPolicy.shouldEndOnStop(
+            isRecording: false, openingMic: false, hasPendingSearch: true))
+        XCTAssertFalse(ATVVTransportPolicy.shouldEndOnStop(
+            isRecording: false, openingMic: true, hasPendingSearch: false))
+        XCTAssertTrue(ATVVTransportPolicy.shouldEndOnStop(
+            isRecording: true, openingMic: false, hasPendingSearch: false))
+    }
+
     func testBuiltInRemoteInventoryAndStrictHardwareMatching() {
         XCTAssertEqual(RemoteDeviceProfileRegistry.builtIn.count, 4)
         XCTAssertEqual(RemoteDeviceProfileRegistry.identify(

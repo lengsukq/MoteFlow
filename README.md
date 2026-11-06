@@ -11,6 +11,7 @@
   <img alt="Swift 5.9" src="https://img.shields.io/badge/Swift-5.9-F05138?style=flat-square&logo=swift&logoColor=white" />
   <img alt="SwiftUI" src="https://img.shields.io/badge/UI-SwiftUI-5B61F6?style=flat-square" />
   <img alt="Development status" src="https://img.shields.io/badge/status-active%20development-4B93D5?style=flat-square" />
+  <img alt="Google remote voice tested" src="https://img.shields.io/badge/Google%20ATVV-voice%20tested-237B71?style=flat-square" />
 </p>
 
 <p align="center">
@@ -18,14 +19,15 @@
   <a href="#支持的遥控器">设备支持</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#语音输入">语音输入</a> ·
+  <a href="#语音故障排查">故障排查</a> ·
   <a href="#开发与测试">开发与测试</a>
 </p>
 
 ---
 
-MoteFlow 是一款 **纯原生 Swift / SwiftUI macOS 应用**：将支持的蓝牙遥控器映射成键盘快捷键、应用启动器与可复用动作，并尝试把遥控器语音通过虚拟麦克风交给 Mac 应用。无需 WebView、Electron 或云端控制后台。
+MoteFlow 是一款 **纯原生 Swift / SwiftUI macOS 应用**：将支持的蓝牙遥控器映射成键盘快捷键、应用启动器与可复用动作，也能通过虚拟麦克风将 Google 遥控器语音送给 Mac 应用。无需 WebView、Electron 或云端控制后台。
 
-> **项目仍在开发中。** 已包含 Google Chromecast Voice Remote 的实机 HID 映射与 ATVV 接收实现；小米遥控器 2 / 2 Pro 目前提供交互示意图、预设和候选 HID 解析，**并不代表完成了实机语音适配**。
+> **实测进展（2026-11-06）：** Google Chromecast Voice Remote → ATVV → BlackHole 2ch → 豆包的语音输入链路，已在项目使用者的 Mac 上实测打通。此结论仅代表该套设备和环境；其他 macOS 版本、Google 遥控器固件及第三方 App 尚未做兼容性矩阵验证。项目仍在开发中，小米遥控器 2 / 2 Pro **未完成实机语音适配**。
 
 ## 功能亮点
 
@@ -33,7 +35,7 @@ MoteFlow 是一款 **纯原生 Swift / SwiftUI macOS 应用**：将支持的蓝�
 | :--- | :--- |
 | 使用可点击的遥控器图示测试高亮、配置单击与长按。Google 和小米拥有独立布局与配置。 | 支持单键、组合键以及左右 Command / Option / Control / Shift；可以录制或用可视化键盘设置。 |
 | **统一动作库** | **ATVV 语音与虚拟麦克风** |
-| 将「打开应用、发送快捷键、执行脚本、等待」组合成可复用动作。 | Google 遥控器支持 ATVV 接收及 PCM 解码；可通过 BlackHole 2ch 将声音路由到选定的输入法。 |
+| 将「打开应用、发送快捷键、执行脚本、等待」组合成可复用动作。 | Google 遥控器的 ATVV 接收、PCM 解码与 BlackHole 2ch → 豆包语音输入已在一套真实环境下验证。 |
 | **多设备预设** | **菜单栏轻量运行** |
 | 不同型号分别保存动作；支持已知 HID 匹配、高级学习和 JSON 备份。 | 收起主窗口后继续监听，菜单栏可查看状态、暂停动作、重新打开设置。 |
 
@@ -42,7 +44,7 @@ MoteFlow 是一款 **纯原生 Swift / SwiftUI macOS 应用**：将支持的蓝�
 
 | 设备 | 图形化按键图 | HID 按键 | BLE / 语音 |
 | :-- | :--: | :-- | :-- |
-| **Google Chromecast Voice Remote (G9N9N)** | ✅ | 已有真机映射；部分特殊键可能由系统接管 | 已实现 ATVV 接收；到第三方输入法的音频链路仍需真机联测 |
+| **Google Chromecast Voice Remote (G9N9N)** | ✅ | 已有真机映射；部分特殊键可能由系统接管 | **ATVV → BlackHole 2ch → 豆包实测通过（2026-11-06，单环境）** |
 | **小米蓝牙遥控器 2 (RC001)** | ✅ | VID/PID 识别、标准 HID Usage 候选；**待实机确认** | **待验证** |
 | **小米蓝牙遥控器 2 Pro (RC003)** | ✅ | 独立预设与候选码；**待实机确认** | **待验证** |
 | **通用遥控器** | ✅ | 提供布局及高级学习入口；不自动接管未知设备 | 依具体硬件协议 |
@@ -105,9 +107,39 @@ flowchart LR
     E -. "唤起听写" .-> D
 ```
 
-**仅触发听写快捷键不会传输遥控器声音。** 如需转发语音，可在「语音 → 麦克风设备」安装或检测 [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole)，启用实时音频路由，并让目标输入法选择 BlackHole 或跟随系统默认输入。MoteFlow 可选择性地在语音会话期间临时切换系统默认输入，结束后尝试恢复。
+**仅触发听写快捷键不会传输遥控器声音。** 要让豆包等应用听见遥控器，必须同时完成遥控器音频采集、PCM 解码、虚拟设备输出与目标应用输入选择。上述链路已在一台 Mac 上实测打通，**不等同于所有设备/应用都已经验收**。
 
-音频兼容性、延迟和第三方输入法的实际转写效果依设备及系统配置而异，仍需实机验证。
+### 按需使用语音（推荐）
+
+1. **连接与监听：** 配对 Google 遥控器，在「语音」页面连接 ATVV 并启用语音键监听；核对协议协商与按键触发状态。
+2. **准备虚拟设备：** 安装 [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole)，进入「语音 → 麦克风设备」，刷新设备并选中 BlackHole 2ch，开启实时路由。
+3. **配置自动切换：** 点击「一键启用按需语音输入」，保持「仅在按语音键时切换到 BlackHole」开启。空闲时系统默认输入应是 MacBook Pro 麦克风或你平时使用的实体麦克风。
+4. **配置豆包：** 让豆包跟随 macOS 系统默认输入，或者在语音会话期间使用 BlackHole 2ch；另将遥控器语音键绑定到豆包的语音输入快捷动作。
+5. **实测：** 按下并说话，观察语音诊断的 ATVV 音频、PCM 解码与 CoreAudio 输出状态，再以豆包实际识别结果确认链路工作；松开后应停止遥控器音频采集，并恢复平时的系统麦克风。
+
+### 按键与设备的生命周期
+
+| 阶段 | 实际行为 |
+| :-- | :-- |
+| **待机** | 保留 ATVV Audio / Control 的**被动 BLE 通知订阅**，为能力协商做准备；**不代表麦克风正在采集**，也不向 BlackHole 输送语音。 |
+| **按下语音键** | 收到 START_SEARCH 后发送 MIC_OPEN；收到 AUDIO_START 才进入真实录音，解码 ATVV ADPCM 并送入 BlackHole 输出队列，按设置临时选择虚拟麦克风。 |
+| **松开 / 音频结束** | 关闭本次音频会话、释放 AudioQueue；如启用自动切换，默认**延迟 1 秒**恢复原实体输入，以便输入法处理末尾语音。可在设置中调整为 **0–3 秒**；再次按键会取消待执行的恢复。 |
+| **停用语音监听 / 断开** | 关闭 ATVV 监听并立即执行输入恢复流程；如果原设备已断开或用户另行切换了输入设备，不强行覆盖当前设置。 |
+
+**与早期版本的区别：** 不能为了「待机不占用麦克风」而关闭 ATVV Audio 的 BLE 通知；部分固件需要 Audio 和 Control 通知都已订阅才能完成 GET_CAPS / MIC_OPEN。真正需要关闭的是麦克风采集与 CoreAudio 输出，而不是协议就绪订阅。另外，过早的 AUDIO_STOP 或重复 START_SEARCH 不应直接取消刚开始的语音会话。
+
+### 语音故障排查
+
+| 现象 | 检查与处理 |
+| :-- | :-- |
+| 豆包被唤起，但没有语音 | 进入「语音链路诊断」核对 AUDIO_START、音频包数、解码帧、PCM 入队与 CoreAudio 是否启动。快捷键触发成功**不代表**声音送达豆包。 |
+| 音频包一直为零 | 核对 ATVV Audio / Control 通知与 GET_CAPS、MIC_OPEN 的先后顺序；不要把待机的被动音频通知误当作占用而关闭。 |
+| PCM 已提交，豆包仍无声 | 核对 BlackHole 路由开关、CoreAudio 输出状态，以及豆包实际使用的麦克风；部分应用会**自行锁定输入设备**，不会跟随 macOS 默认输入改变。 |
+| 松开后系统仍默认 BlackHole | 打开「语音 → 麦克风设备」，将**空闲麦克风**选回 MacBook Pro 麦克风或其他实体设备，再启用按需切换。新版本会尝试识别旧配置遗留的 BlackHole 默认输入并恢复实体设备，但无法安全确认目标时需要人工选择。 |
+| 第一次按下立刻停止 / 长按中断 | 检查 ATVV 控制日志中是否出现过期 AUDIO_STOP 或重复 START_SEARCH；当前逻辑不将其直接视为有效停止。仅长按已建立的录音会话才应受有效停止指令控制。 |
+| 频繁按键时音频设备来回跳 | 调整「松开后延迟恢复」到合适值（默认 1 秒），下一次按键会取消尚未执行的输入恢复。 |
+
+> **验收边界：** 2026-11-06 的成功结论来自项目使用者在真实 Google 遥控器、Mac 和豆包环境下的手动测试。自动化测试可以验证数据帧、映射与状态策略，但无法代替不同版本 macOS、蓝牙固件、系统权限以及第三方输入法的端到端验证。请勿把诊断中「PCM 入队」单独解读成豆包一定已接收到声音。
 
 ## 开发与测试
 
@@ -159,7 +191,8 @@ Package.swift           可独立测试的协议/映射核心
 - [x] BlackHole 设备管理与 PCM 路由代码
 - [x] 菜单栏轻量模式
 - [ ] 小米遥控器 2 / 2 Pro 实体 HID 与语音通道验收
-- [ ] BlackHole → 豆包的端到端转写验收
+- [x] Google 遥控器 → ATVV → BlackHole 2ch → 豆包语音输入单环境实测（2026-11-06）
+- [ ] 其他 Mac / macOS 版本、遥控器固件及第三方语音应用兼容性验收
 - [ ] 休眠唤醒、蓝牙重连和长时间轻量模式稳定性验收
 - [ ] 完整的安装发布、设备兼容性测试矩阵
 

@@ -37,18 +37,30 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
             if !autoSwitchInputForVoice { finishVoiceInputWindow() }
         }
     }
+    /// Briefly retain the selected virtual input after key-up so dictation
+    /// applications can finish flushing their final recognized syllables.
+    @Published var inputRestoreDelaySeconds: Double {
+        didSet {
+            UserDefaults.standard.set(inputRestoreDelaySeconds, forKey: Self.restoreDelayKey)
+        }
+    }
     @Published private(set) var systemInputName = "未读取系统输入设备"
     @Published private(set) var selectedIsDefaultInput = false
     @Published private(set) var inputStatus = "系统默认麦克风尚未配置"
     @Published private(set) var isVoiceInputTemporarilySwitched = false
     var canRestoreManualInput: Bool { manualPreviousInputUID != nil }
     @Published private(set) var isRouting = false
+    @Published private(set) var outputStarted = false
+    @Published private(set) var lastSessionOutputStarted = false
     @Published private(set) var status = "等待检查虚拟音频设备"
     @Published private(set) var forwardedFrames = 0
 
     private static let uidKey = "GoogleRemote.virtualMicOutputUID.v1"
     private static let enabledKey = "GoogleRemote.virtualMicEnabled.v1"
     private static let switchInputKey = "GoogleRemote.virtualMicAutoInput.v1"
+    private static let restoreDelayKey = "MoteFlow.virtualMicRestoreGrace.v1"
+    private static let preferredPhysicalInputKey = "MoteFlow.preferredIdleInputUID.v1"
+    static let defaultRestoreDelaySeconds = 1.0
     private static let outputRate = ATVVVirtualMicPCM.outputRate
     private var queue: AudioQueueRef?
     private var queuedFrames = 0
@@ -59,6 +71,10 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
     /// input on a future launch to recover from a stale UserDefaults value.
     private var temporaryPreviousInputUID: String?
     private var manualPreviousInputUID: String?
+    /// Last validated physical default input, used when an earlier version
+    /// left BlackHole selected before the current session started.
+    private var preferredPhysicalInputUID: String?
+    private var pendingInputRestoration: Task<Void, Never>?
 
     init(defaults: UserDefaults = .standard) {
         selectedUID = defaults.string(forKey: Self.uidKey) ?? ""
@@ -66,6 +82,9 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
         // Newly configured installations should never permanently switch the
         // default system microphone just because BlackHole is installed.
         autoSwitchInputForVoice = defaults.object(forKey: Self.switchInputKey) as? Bool ?? true
+        let storedGrace = defaults.object(forKey: Self.restoreDelayKey) as? Double
+        inputRestoreDelaySeconds = min(3, max(0, storedGrace ?? Self.defaultRestoreDelaySeconds))
+        preferredPhysicalInputUID = defaults.string(forKey: Self.preferredPhysicalInputKey)
         refreshDevices()
     }
 
@@ -98,6 +117,8 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
         refreshInputState()
         if result == noErr && !selectedIsDefaultInput {
             manualPreviousInputUID = nil
+            preferredPhysicalInputUID = uid
+            UserDefaults.standard.set(uid, forKey: Self.preferredPhysicalInputKey)
             inputStatus = "空闲麦克风已恢复为「\(systemInputName)」；语音键按下时自动切换。"
         } else {
             inputStatus = "恢复系统麦克风失败（CoreAudio \(result)）。"
@@ -182,6 +203,34 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
             "未知输入设备"
         selectedIsDefaultInput =
             Self.deviceString(current, selector: kAudioDevicePropertyDeviceUID) == selectedUID
+        // Never store BlackHole as the preferred idle input. Remember only
+        // actual input-capable devices outside the virtual loopback list.
+        if let uid = Self.deviceString(current, selector: kAudioDevicePropertyDeviceUID),
+           physicalInputs.contains(where: { $0.id == uid }),
+           uid != selectedUID {
+            preferredPhysicalInputUID = uid
+            UserDefaults.standard.set(uid, forKey: Self.preferredPhysicalInputKey)
+        }
+    }
+
+    /// If we inherited BlackHole as the default from an older installation,
+    /// CoreAudio cannot tell us the former microphone. Use an explicitly
+    /// remembered physical input; otherwise prefer a built-in Mac mic. Avoid
+    /// choosing an arbitrary camera/headset when several candidates exist.
+    private func recoveryInputUID() -> String? {
+        if let preferredPhysicalInputUID,
+           physicalInputs.contains(where: { $0.id == preferredPhysicalInputUID }),
+           let id = Self.idForUID(preferredPhysicalInputUID),
+           Self.inputSupportsCapture(id) {
+            return preferredPhysicalInputUID
+        }
+        let builtIn = physicalInputs.filter {
+            let name = $0.name.lowercased()
+            return name.contains("macbook") || name.contains("built-in") ||
+                   name.contains("内建") || name.contains("内置")
+        }
+        if builtIn.count == 1 { return builtIn[0].id }
+        return physicalInputs.count == 1 ? physicalInputs[0].id : nil
     }
 
     /// One-click, explicitly user-initiated input selection. Does not touch
@@ -219,11 +268,29 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
 
     /// Called BEFORE sending Doubao's hotkey, so it picks up the new input.
     func prepareVoiceInputWindow() {
+        // Back-to-back voice sessions retain BlackHole without oscillating the
+        // macOS default input between physical and virtual microphones.
+        pendingInputRestoration?.cancel()
+        pendingInputRestoration = nil
         guard autoSwitchInputForVoice && isEnabled, !isVoiceInputTemporarilySwitched,
               let targetID = Self.idForUID(selectedUID),
               Self.inputSupportsCapture(targetID),
               let previous = Self.defaultInputID() else { return }
-        if previous == targetID { refreshInputState(); return }
+        if previous == targetID {
+            // Legacy settings may have left BlackHole as the system default.
+            // No temporaryPreviousInputUID was ever captured in that case,
+            // making key-up restoration a silent no-op. Recover a safe
+            // physical input for the END of this voice session.
+            if temporaryPreviousInputUID == nil, let recovered = recoveryInputUID() {
+                temporaryPreviousInputUID = recovered
+                isVoiceInputTemporarilySwitched = true
+                inputStatus = "检测到系统原本已选 BlackHole；松开语音键后恢复实体麦克风。"
+            } else if temporaryPreviousInputUID == nil {
+                inputStatus = "系统原本已选 BlackHole，未能确定原麦克风；请在设备页选择一次常用输入。"
+            }
+            refreshInputState()
+            return
+        }
         guard let oldUID = Self.deviceString(previous, selector: kAudioDevicePropertyDeviceUID)
         else { return }
         let result = Self.setDefaultInputID(targetID)
@@ -237,9 +304,33 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
         }
     }
 
+    /// Normal key-up path: stop AudioQueue first, then restore input after
+    /// a short configurable grace. The next key-down cancels this task.
+    func scheduleVoiceInputRestoration() {
+        guard temporaryPreviousInputUID != nil else { return }
+        pendingInputRestoration?.cancel()
+        let delay = min(3, max(0, inputRestoreDelaySeconds))
+        guard delay > 0 else {
+            finishVoiceInputWindow()
+            return
+        }
+        inputStatus = "遥控器录音已停止，\(String(format: "%.2f", delay)) 秒后恢复原麦克风（豆包转写收尾）"
+        pendingInputRestoration = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.finishVoiceInputWindow()
+        }
+    }
+
     /// Restores only if the current input is still the device WE installed:
     /// never undo an independent switch made by the user or another app.
     func finishVoiceInputWindow() {
+        pendingInputRestoration?.cancel()
+        pendingInputRestoration = nil
         guard let oldUID = temporaryPreviousInputUID else { return }
         temporaryPreviousInputUID = nil
         isVoiceInputTemporarilySwitched = false
@@ -396,8 +487,10 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
         queuedFrames = 0
         forwardedFrames = 0
         started = false
+        outputStarted = false
+        lastSessionOutputStarted = false
         isRouting = true
-        status = "已连接「\(selected.name)」，等待音频预缓冲；请在豆包中将麦克风选为此设备。"
+        status = "已连接「\(selected.name)」输出队列，尚未开始播放；请确认豆包使用该设备。"
     }
 
     func write(samples: [Int16], sampleRate: Int) {
@@ -435,6 +528,8 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
             let startedStatus = AudioQueueStart(queue, nil)
             if startedStatus == noErr {
                 started = true
+                outputStarted = true
+                lastSessionOutputStarted = true
                 status = "正在实时向虚拟麦克风输出遥控器语音（48 kHz / 双声道）"
             } else {
                 status = "虚拟麦克风播放启动失败：\(startedStatus)"
@@ -443,7 +538,7 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
         }
         if started && Date().timeIntervalSince(lastStatusUpdate) >= 1 {
             lastStatusUpdate = Date()
-            status = "已输出 \(forwardedFrames / 48_000) 秒遥控器音频到虚拟麦克风"
+            status = "已向虚拟音频播放队列提交 \(forwardedFrames / 48_000) 秒 PCM；豆包采集效果仍需验证"
         }
     }
 
@@ -455,6 +550,7 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
         queue = nil
         queuedFrames = 0
         started = false
+        outputStarted = false
         if isRouting {
             isRouting = false
             status = "语音会话已结束，虚拟麦克风输出已停止。"
@@ -548,6 +644,23 @@ struct RemoteVirtualMicrophoneSettings: View {
                                isOn: $router.autoSwitchInputForVoice)
                             .toggleStyle(.switch)
                             .disabled(!router.isEnabled || router.selectedUID.isEmpty)
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("松开语音键后，延迟恢复原麦克风")
+                                    .font(.system(size: 11, weight: .medium))
+                                Spacer(minLength: 8)
+                                Text("\(router.inputRestoreDelaySeconds, specifier: "%.2f") 秒")
+                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(RemotePalette.indigo)
+                            }
+                            Slider(value: $router.inputRestoreDelaySeconds,
+                                   in: 0...3, step: 0.25)
+                                .disabled(!router.autoSwitchInputForVoice || !router.isEnabled)
+                            Text("默认 1 秒。松开立即关闭音频输出，但暂时保留 BlackHole 作为输入，让豆包完成末尾转写；再次按键会取消这次恢复。")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         if router.selectedIsDefaultInput && !router.isVoiceInputTemporarilySwitched &&
                            !router.isRouting {
                             Label("当前系统默认输入仍为 BlackHole。平时建议切回内建或其他实体麦克风，以免影响别的语音软件。",
@@ -586,7 +699,7 @@ struct RemoteVirtualMicrophoneSettings: View {
                     .padding(12)
                     .background(RemotePalette.indigo.opacity(0.045), in: RoundedRectangle(cornerRadius: 13))
                 }
-                Text("待机时不会打开 BlackHole 音频输出，也不会占用音频通知；只有遥控器语音会话才启动音频。建议豆包设置为「跟随系统默认麦克风」；如果豆包固定了独立麦克风，需在豆包内修改一次。")
+                Text("待机时不会打开 BlackHole 音频输出；ATVV Audio / Control 通知保持被动订阅以确保按键立即响应，但不采集声音。建议豆包设置为「跟随系统默认麦克风」；如果豆包固定了独立麦克风，需在豆包内修改一次。")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
