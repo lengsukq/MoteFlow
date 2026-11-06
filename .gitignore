@@ -1,0 +1,58 @@
+# SwiftPM, Xcode and local build artifacts
+.build/
+.swiftpm/
+DerivedData/
+build/
+*.xcresult
+*.app/
+*.dSYM/
+*.ipa
+*.xcarchive/
+
+# Local editor / tools state
+.DS_Store
+._*
+.idea/
+.vscode/
+.coding-tools/
+*.xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# Python and generated previews
+__pycache__/
+*.py[cod]
+design/
+scripts/.*.b64
+scripts/.*.webp
+
+# Secrets, signing and environment overrides
+.env
+.env.*
+!.env.example
+*.p12
+*.p8
+*.mobileprovision
+*.provisionprofile
+*.cer
+*.pem
+*.key
+*.local.xcconfig
+Config.local.xcconfig
+
+# Debug traces, HID samples and audio captures
+logs/
+captures/
+diagnostics/
+*.hidlog
+*.wav
+*.aiff
+*.caf
+*.pcm
+
+# Internal development records and machine migration utilities
+docs/DEVELOPMENT.md
+docs/REMOTE-ACTIONS-VOICE.md
+docs/UI-CLOSURE-AUDIT.md
+scripts/activate_moteflow.py

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="../GoogleRemote/Assets.xcassets/AppIcon.appiconset/mote-flow-256.png" width="112" alt="MoteFlow icon" />
+  <img src="GoogleRemote/Assets.xcassets/AppIcon.appiconset/mote-flow-256.png" width="112" alt="MoteFlow icon" />
 </p>
 
 <h1 align="center">MoteFlow</h1>
@@ -29,56 +29,14 @@ MoteFlow 是一款 **纯原生 Swift / SwiftUI macOS 应用**：将支持的蓝�
 
 ## 功能亮点
 
-<table>
-<tr>
-<td width="50%" valign="top">
+| 可视化遥控器 | 自由绑定快捷键 |
+| :--- | :--- |
+| 使用可点击的遥控器图示测试高亮、配置单击与长按。Google 和小米拥有独立布局与配置。 | 支持单键、组合键以及左右 Command / Option / Control / Shift；可以录制或用可视化键盘设置。 |
+| **统一动作库** | **ATVV 语音与虚拟麦克风** |
+| 将「打开应用、发送快捷键、执行脚本、等待」组合成可复用动作。 | Google 遥控器支持 ATVV 接收及 PCM 解码；可通过 BlackHole 2ch 将声音路由到选定的输入法。 |
+| **多设备预设** | **菜单栏轻量运行** |
+| 不同型号分别保存动作；支持已知 HID 匹配、高级学习和 JSON 备份。 | 收起主窗口后继续监听，菜单栏可查看状态、暂停动作、重新打开设置。 |
 
-**🎮 可视化遥控器**
-
-使用可点击的遥控器图示选中实体按键，直接测试高亮反馈、编辑单击与长按动作。Google 和小米遥控器拥有独立布局与配置。
-
-</td>
-<td width="50%" valign="top">
-
-**⌨️ 自由绑定快捷键**
-
-支持单键、组合键以及单独的左右 Command / Option / Control / Shift；可选录制实体按键或在图形化键盘中直接设置。
-
-</td>
-</tr>
-<tr>
-<td valign="top">
-
-**⚡ 统一动作库**
-
-组合「打开应用、发送快捷键、执行脚本、等待」等步骤，保存为动作模板，再绑定到多个遥控器按键。
-
-</td>
-<td valign="top">
-
-**🎙️ ATVV 语音与虚拟麦克风**
-
-Google 遥控器语音接收、ADPCM 解码、WAV 导出；可选择 BlackHole 2ch，将 PCM 路由到 macOS 的虚拟输入设备。豆包等第三方输入法需要跟随相应麦克风。
-
-</td>
-</tr>
-<tr>
-<td valign="top">
-
-**🧭 多设备预设**
-
-每种设备独立保存按键动作；预设可根据受信任的 HID 标识匹配，同时保留高级逐键学习与 JSON 备份。
-
-</td>
-<td valign="top">
-
-**☁️ 菜单栏轻量运行**
-
-收起主窗口后仍可保留监听、查看 HID / BLE 状态、暂停动作执行，或从菜单栏重新打开设置。
-
-</td>
-</tr>
-</table>
 
 ## 支持的遥控器
 
@@ -182,9 +140,9 @@ Package.swift           可独立测试的协议/映射核心
 ```
 
 更多细节：
-[遥控器型号与适配边界](REMOTE-PROFILES.md) ·
-[HID 学习与映射导入](HID-MAPPING-PROFILES.md) ·
-[品牌与图标](BRANDING.md)
+[遥控器型号与适配边界](docs/REMOTE-PROFILES.md) ·
+[HID 学习与映射导入](docs/HID-MAPPING-PROFILES.md) ·
+[品牌与图标](docs/BRANDING.md)
 
 ## 安全与隐私
 
