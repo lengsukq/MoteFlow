@@ -325,6 +325,7 @@ struct ContentView: View {
             }
             hidCapture.onVoiceSessionEnd = { [weak bluetooth, weak actionRunner] in
                 actionRunner?.endVoiceShortcutHold()
+                bluetooth?.stopCurrentVoiceSession()
                 bluetooth?.virtualMicrophone.finishVoiceInputWindow()
             }
             hidCapture.longPressThresholdForKey = { [weak mappingStore] key in

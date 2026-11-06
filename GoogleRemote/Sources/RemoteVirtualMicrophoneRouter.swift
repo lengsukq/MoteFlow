@@ -15,6 +15,7 @@ struct RemoteVirtualAudioDevice: Identifiable, Equatable {
 @MainActor
 final class RemoteVirtualMicrophoneRouter: ObservableObject {
     @Published private(set) var devices: [RemoteVirtualAudioDevice] = []
+    @Published private(set) var physicalInputs: [RemoteVirtualAudioDevice] = []
     @Published var selectedUID: String {
         didSet {
             finishVoiceInputWindow()
@@ -62,8 +63,45 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         selectedUID = defaults.string(forKey: Self.uidKey) ?? ""
         isEnabled = defaults.bool(forKey: Self.enabledKey)
-        autoSwitchInputForVoice = defaults.bool(forKey: Self.switchInputKey)
+        // Newly configured installations should never permanently switch the
+        // default system microphone just because BlackHole is installed.
+        autoSwitchInputForVoice = defaults.object(forKey: Self.switchInputKey) as? Bool ?? true
         refreshDevices()
+    }
+
+    /// Preferred one-click configuration. The input stays with other apps
+    /// while idle; only the remote voice session temporarily uses BlackHole.
+    func configureOnDemandInput() {
+        guard isEnabled && devices.contains(where: { $0.id == selectedUID }) else {
+            inputStatus = "先启用虚拟麦克风路由并选择可用设备。"
+            return
+        }
+        autoSwitchInputForVoice = true
+        if manualPreviousInputUID != nil {
+            restoreManuallySelectedInput()
+        }
+        refreshInputState()
+        inputStatus = selectedIsDefaultInput
+            ? "已开启按键式切换，但系统当前仍选择 BlackHole。请在下方选回平时使用的麦克风。"
+            : "已启用按键式切换：平时使用「\(systemInputName)」，只在说话时切到 BlackHole。"
+    }
+
+    func chooseIdleSystemInput(_ uid: String) {
+        guard !isVoiceInputTemporarilySwitched && !isRouting &&
+              selectedIsDefaultInput &&
+              physicalInputs.contains(where: { $0.id == uid }),
+              let target = Self.idForUID(uid), Self.inputSupportsCapture(target) else {
+            inputStatus = "当前正在语音采集，或目标不是可用的麦克风，无法修改。"
+            return
+        }
+        let result = Self.setDefaultInputID(target)
+        refreshInputState()
+        if result == noErr && !selectedIsDefaultInput {
+            manualPreviousInputUID = nil
+            inputStatus = "空闲麦克风已恢复为「\(systemInputName)」；语音键按下时自动切换。"
+        } else {
+            inputStatus = "恢复系统麦克风失败（CoreAudio \(result)）。"
+        }
     }
 
     private static func defaultInputID() -> AudioDeviceID? {
@@ -267,6 +305,15 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
             let lower = name.lowercased()
             guard lower.contains("blackhole") || lower.contains("loopback") ||
                   lower.contains("virtual microphone") else { return nil }
+            return RemoteVirtualAudioDevice(id: uid, name: name)
+        }
+        physicalInputs = ids.compactMap { id -> RemoteVirtualAudioDevice? in
+            guard let name = Self.deviceString(id, selector: kAudioObjectPropertyName),
+                  let uid = Self.deviceString(id, selector: kAudioDevicePropertyDeviceUID),
+                  Self.inputSupportsCapture(id) else { return nil }
+            let lowered = name.lowercased()
+            guard !lowered.contains("blackhole"), !lowered.contains("loopback"),
+                  !lowered.contains("virtual microphone") else { return nil }
             return RemoteVirtualAudioDevice(id: uid, name: name)
         }
         // A single installed virtual microphone should never force another
@@ -488,28 +535,49 @@ struct RemoteVirtualMicrophoneSettings: View {
                             }
                             Spacer(minLength: 0)
                         }
-                        HStack(spacing: 9) {
-                            Button {
-                                router.useSelectedAsDefaultInput()
-                            } label: {
-                                Label(router.selectedIsDefaultInput ? "已设为系统麦克风" : "一键设为系统麦克风",
-                                      systemImage: router.selectedIsDefaultInput
-                                        ? "checkmark.circle.fill" : "mic.fill")
-                            }
-                            .buttonStyle(RemoteActionButtonStyle(emphasized: !router.selectedIsDefaultInput))
-                            .disabled(!router.isEnabled || router.selectedUID.isEmpty ||
-                                      router.selectedIsDefaultInput)
-                            if router.selectedIsDefaultInput && router.canRestoreManualInput {
-                                Button("恢复原麦克风") {
+                        Button {
+                            router.configureOnDemandInput()
+                        } label: {
+                            Label("一键启用按需语音输入",
+                                  systemImage: "mic.badge.plus")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(RemoteActionButtonStyle(emphasized: !router.autoSwitchInputForVoice))
+                        .disabled(!router.isEnabled || router.selectedUID.isEmpty)
+                        Toggle("仅在按语音键时切换到 BlackHole，结束后恢复原麦克风",
+                               isOn: $router.autoSwitchInputForVoice)
+                            .toggleStyle(.switch)
+                            .disabled(!router.isEnabled || router.selectedUID.isEmpty)
+                        if router.selectedIsDefaultInput && !router.isVoiceInputTemporarilySwitched &&
+                           !router.isRouting {
+                            Label("当前系统默认输入仍为 BlackHole。平时建议切回内建或其他实体麦克风，以免影响别的语音软件。",
+                                  systemImage: "exclamationmark.triangle")
+                                .font(.system(size: 11))
+                                .foregroundStyle(RemotePalette.amber)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if router.canRestoreManualInput {
+                                Button("恢复之前使用的麦克风") {
                                     router.restoreManuallySelectedInput()
                                 }
                                 .buttonStyle(RemoteActionButtonStyle())
+                            } else if !router.physicalInputs.isEmpty {
+                                Text("选择平时使用的麦克风：")
+                                    .font(.system(size: 11, weight: .medium))
+                                LazyVGrid(columns: [GridItem(.adaptive(minimum: 175), spacing: 8)],
+                                          spacing: 8) {
+                                    ForEach(router.physicalInputs) { device in
+                                        RemoteVisualOption(
+                                            title: device.name,
+                                            subtitle: "恢复为空闲输入设备",
+                                            symbol: "mic",
+                                            selected: false,
+                                            compact: true,
+                                            action: { router.chooseIdleSystemInput(device.id) }
+                                        )
+                                    }
+                                }
                             }
-                            Spacer(minLength: 0)
                         }
-                        Toggle("使用遥控器语音时自动切换麦克风，结束后恢复", isOn: $router.autoSwitchInputForVoice)
-                            .toggleStyle(.switch)
-                            .disabled(!router.isEnabled || router.selectedUID.isEmpty)
                         Text(router.inputStatus)
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
@@ -518,7 +586,7 @@ struct RemoteVirtualMicrophoneSettings: View {
                     .padding(12)
                     .background(RemotePalette.indigo.opacity(0.045), in: RoundedRectangle(cornerRadius: 13))
                 }
-                Text("不需要再打开「系统设置 → 声音」：上面可以直接修改系统默认输入，且不会修改默认扬声器。豆包需要设置为「跟随系统默认麦克风」；如果豆包单独固定了麦克风，仍需在豆包内改一次。")
+                Text("待机时不会打开 BlackHole 音频输出，也不会占用音频通知；只有遥控器语音会话才启动音频。建议豆包设置为「跟随系统默认麦克风」；如果豆包固定了独立麦克风，需在豆包内修改一次。")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

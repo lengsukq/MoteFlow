@@ -21,6 +21,10 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
     @Published private(set) var logs: [String] = []
     @Published private(set) var atvvFound = false
     @Published private(set) var voiceModeEnabled = false
+    /// True only while the ATVV audio characteristic is subscribed or a
+    /// microphone-open request is in flight. Idle control notifications are
+    /// intentionally not treated as microphone capture.
+    @Published private(set) var audioChannelActive = false
     @Published private(set) var voiceStatus = "等待连接 ATVV 遥控器"
     @Published private(set) var protocolDetails = "尚未协商"
     @Published private(set) var isRecording = false
@@ -67,6 +71,10 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
     private var atvvAudio: CBCharacteristic?
     private var atvvCTL: CBCharacteristic?
     private var negotiationRequested = false
+    private var microphoneOpenPending = false
+    private var microphoneOpenTimeout: Task<Void, Never>?
+    private var audioSilenceWatchdog: Task<Void, Never>?
+    private var lastVoicePacketAt: Date?
     private var capabilities: ATVVCapabilities?
     private var pendingAudio = ATVVLegacyAssembler()
     private var v1Decoder = ATVVV1StreamDecoder()
@@ -116,11 +124,15 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
     func connect(to id: UUID) {
         guard let peripheral = discovered[id] else { log("设备不在发现列表中"); return }
         manuallyDisconnected = false
-        if let active, active.identifier != id { central.cancelPeripheralConnection(active) }
-        active = peripheral
-        peripheral.delegate = self
+        // Stop the previous peripheral's notifications before replacing it.
+        if let previous = active, previous.identifier != id {
+            stopVoiceMode()
+            central.cancelPeripheralConnection(previous)
+        }
         resetATVV()
         resetBLEHID()
+        active = peripheral
+        peripheral.delegate = self
         discoveredServices.removeAll()
         connectionSummary = "连接中：\(peripheral.name ?? id.uuidString)"
         if isScanning { central.stopScan(); isScanning = false }
@@ -192,33 +204,54 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
 
     func toggleVoiceMode() {
         if voiceModeEnabled { stopVoiceMode(); return }
-        guard canEnableVoiceMode, let active, let atvvAudio, let atvvCTL else {
+        guard canEnableVoiceMode, let active, let atvvCTL else {
             log("ATVV 音频特征未齐全，无法启用语音")
             return
         }
         voiceModeEnabled = true
-        voiceStatus = "正在订阅音频与控制通知"
+        voiceStatus = "语音按键待机 · 音频采集已关闭"
         negotiationRequested = false
+        microphoneOpenPending = false
+        audioChannelActive = false
         capabilities = nil
         protocolDetails = "等待能力协商"
-        active.setNotifyValue(true, for: atvvAudio)
+        // Only the tiny control channel stays subscribed. Subscribing to the
+        // audio characteristic here leaves the remote mic resource busy even
+        // though no dictation is in progress.
         active.setNotifyValue(true, for: atvvCTL)
-        log("语音模式开启：等待两路通知订阅成功后发送 GET_CAPS")
+        log("ATVV 控制待机：音频通知关闭，等待控制通道协商")
     }
 
     func stopVoiceMode() {
-        if voiceModeEnabled, isRecording {
+        if voiceModeEnabled, (isRecording || microphoneOpenPending || audioChannelActive) {
             let close = capabilities?.isLegacy == false ? ATVV.micCloseV1 : ATVV.micClose
             sendATVV(close, title: "MIC_CLOSE")
         }
         finishAudio(reason: "语音模式已关闭")
         voiceModeEnabled = false
         negotiationRequested = false
+        microphoneOpenPending = false
+        audioChannelActive = false
         if let active {
             if let atvvAudio, atvvAudio.isNotifying { active.setNotifyValue(false, for: atvvAudio) }
             if let atvvCTL, atvvCTL.isNotifying { active.setNotifyValue(false, for: atvvCTL) }
         }
-        voiceStatus = atvvFound ? "语音模式未启用" : "未发现 ATVV 服务"
+        voiceStatus = atvvFound ? "语音按键监听已关闭 · 音频采集已释放" : "未发现 ATVV 服务"
+    }
+
+    /// Release the current microphone lease when HID sends a physical key-up,
+    /// without disabling BLE control notification for the next press.
+    func stopCurrentVoiceSession() {
+        guard isRecording || microphoneOpenPending || audioChannelActive else {
+            virtualMicrophone.endSession()
+            virtualMicrophone.finishVoiceInputWindow()
+            return
+        }
+        if voiceModeEnabled {
+            sendATVV(capabilities?.isLegacy == false ? ATVV.micCloseV1 : ATVV.micClose,
+                     title: "MIC_CLOSE (physical key release)")
+        }
+        finishAudio(reason: "遥控器语音键已释放")
     }
 
     private func register(_ peripheral: CBPeripheral, name: String, rssi: Int) {
@@ -236,6 +269,8 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
         finishAudio(reason: "音频会话重置")
         atvvFound = false
         voiceModeEnabled = false
+        microphoneOpenPending = false
+        audioChannelActive = false
         atvvTX = nil
         atvvAudio = nil
         atvvCTL = nil
@@ -248,7 +283,7 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
 
     private func negotiateIfReady() {
         guard voiceModeEnabled, !negotiationRequested,
-              atvvAudio?.isNotifying == true, atvvCTL?.isNotifying == true else { return }
+              atvvCTL?.isNotifying == true else { return }
         negotiationRequested = true
         voiceStatus = "正在协商语音协议"
         sendATVV(ATVV.getCapabilities, title: "GET_CAPS")
@@ -273,8 +308,26 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
 
     private func beginAudio(codec: UInt8?) {
         guard voiceModeEnabled else { return }
-        if isRecording { finishAudio(reason: "重新开始录音", notifySessionEnd: false) }
+        if isRecording { finishAudio(reason: "重新开始录音", notifySessionEnd: false,
+                                    releaseAudioChannel: false) }
+        microphoneOpenTimeout?.cancel()
+        microphoneOpenTimeout = nil
+        microphoneOpenPending = false
+        audioChannelActive = true
         isRecording = true
+        lastVoicePacketAt = Date()
+        audioSilenceWatchdog?.cancel()
+        audioSilenceWatchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(800))
+                guard !Task.isCancelled, let self, self.isRecording else { return }
+                if let last = self.lastVoicePacketAt, Date().timeIntervalSince(last) >= 3 {
+                    self.log("音频超过 3 秒未送达，关闭当前语音会话以防占用麦克风")
+                    self.stopCurrentVoiceSession()
+                    return
+                }
+            }
+        }
         recordedSamples.removeAll(keepingCapacity: true)
         packetTotal = 0
         byteTotal = 0
@@ -305,17 +358,72 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
         }
     }
 
-    private func finishAudio(reason: String, notifySessionEnd: Bool = true) {
+    private func finishAudio(reason: String, notifySessionEnd: Bool = true,
+                             releaseAudioChannel: Bool = true) {
         virtualMicrophone.endSession()
+        if releaseAudioChannel {
+            virtualMicrophone.finishVoiceInputWindow()
+        }
+        audioSilenceWatchdog?.cancel()
+        audioSilenceWatchdog = nil
+        lastVoicePacketAt = nil
         if isRecording { log("\(reason)：共 \(packetTotal) 包 / \(frameTotal) 解码块") }
         isRecording = false
         publishAudioMetrics(force: true)
         keepaliveTask?.cancel()
         keepaliveTask = nil
         audioLevel = 0
-        if voiceModeEnabled { voiceStatus = "语音就绪：按遥控器麦克风键" }
+        if releaseAudioChannel {
+            microphoneOpenTimeout?.cancel()
+            microphoneOpenTimeout = nil
+            microphoneOpenPending = false
+            audioChannelActive = false
+            // Release the BLE audio notification without disconnecting the
+            // control characteristic that detects the next voice button.
+            if let active, active.state == .connected,
+               let atvvAudio, atvvAudio.isNotifying {
+                active.setNotifyValue(false, for: atvvAudio)
+            }
+        }
+        if voiceModeEnabled {
+            voiceStatus = releaseAudioChannel
+                ? "语音按键待机 · 音频采集已关闭"
+                : "正在重新同步遥控器语音"
+        }
         pendingAudio.reset()
         if notifySessionEnd { onATVVAudioEnded?() }
+    }
+
+    private func openMicrophoneOnDemand() {
+        guard voiceModeEnabled, !isRecording, !microphoneOpenPending,
+              let active, let atvvAudio, let capabilities,
+              capabilities.supports8k || capabilities.supports16k else { return }
+        microphoneOpenPending = true
+        audioChannelActive = true
+        voiceStatus = "语音键已按下 · 正在开启音频通道"
+        microphoneOpenTimeout?.cancel()
+        microphoneOpenTimeout = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(6))
+            guard let self, !Task.isCancelled, self.audioChannelActive,
+                  !self.isRecording else { return }
+            let close = self.capabilities?.isLegacy == false ? ATVV.micCloseV1 : ATVV.micClose
+            self.sendATVV(close, title: "MIC_CLOSE (start timeout)")
+            self.finishAudio(reason: "遥控器音频开启超时，已释放通道")
+        }
+        if atvvAudio.isNotifying {
+            completePendingMicrophoneOpen()
+        } else {
+            active.setNotifyValue(true, for: atvvAudio)
+            log("语音键触发：按需订阅 ATVV 音频通知")
+        }
+    }
+
+    private func completePendingMicrophoneOpen() {
+        guard microphoneOpenPending, voiceModeEnabled, let atvvAudio,
+              atvvAudio.isNotifying, let capabilities else { return }
+        microphoneOpenPending = false
+        sendATVV(ATVV.micOpen(codec: capabilities.supports8k ? 0x0001 : 0x0002),
+                 title: "MIC_OPEN (on demand)")
     }
 
     private func processControl(_ data: Data) {
@@ -332,26 +440,41 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
             capabilities = caps
             protocolDetails = "ATVV \(caps.displayVersion) · codec mask 0x\(String(caps.codecMask, radix: 16))" +
                 " · packet \(caps.frameSize ?? 0)B"
-            voiceStatus = caps.supports8k || caps.supports16k ? "语音就绪：按遥控器麦克风键" : "不支持已实现的 ADPCM 编码，当前只能诊断"
+            voiceStatus = caps.supports8k || caps.supports16k
+                ? "语音按键待机 · 音频采集已关闭"
+                : "不支持已实现的 ADPCM 编码，当前只能诊断"
             log("能力协商成功：\(protocolDetails)")
         case 0x08:
-            guard let capabilities else { log("按键事件早于能力协商，忽略"); return }
+            guard let capabilities else {
+                log("语音键触发早于 ATVV 能力协商，不能打开音频")
+                // The HID/control callback may already have started a
+                // simulated dictation shortcut. Release it immediately.
+                onATVVAudioEnded?()
+                return
+            }
             if isRecording {
                 if capabilities.isLegacy {
                     sendATVV(ATVV.micClose, title: "MIC_CLOSE (toggle)")
                     finishAudio(reason: "再次按下麦克风键")
                 }
             } else if capabilities.supports8k || capabilities.supports16k {
-                sendATVV(ATVV.micOpen(codec: capabilities.supports8k ? 0x0001 : 0x0002), title: "MIC_OPEN")
+                openMicrophoneOnDemand()
             } else {
                 log("遥控器不支持 ADPCM 8k/16k 模式，未发送 MIC_OPEN")
             }
         case 0x04:
+            guard audioChannelActive || microphoneOpenPending else {
+                log("收到非语音会话的 AUDIO_START，拒绝后台占用音频通道")
+                sendATVV(capabilities?.isLegacy == false ? ATVV.micCloseV1 : ATVV.micClose,
+                         title: "MIC_CLOSE (unexpected audio)")
+                return
+            }
             // For v1.0, bytes 2 and 3 may contain codec and stream id.
             beginAudio(codec: bytes.count >= 3 ? bytes[2] : 0x01)
         case 0x00:
-            if capabilities?.isLegacy == true, isRecording {
-                sendATVV(ATVV.micClose, title: "MIC_CLOSE")
+            if isRecording || microphoneOpenPending || audioChannelActive {
+                let close = capabilities?.isLegacy == false ? ATVV.micCloseV1 : ATVV.micClose
+                sendATVV(close, title: "MIC_CLOSE")
             }
             finishAudio(reason: "遥控器停止发送音频")
         case 0x0A:
@@ -376,6 +499,7 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
 
     private func processAudio(_ data: Data) {
         guard voiceModeEnabled, isRecording else { return }
+        lastVoicePacketAt = Date()
         packetTotal += 1
         byteTotal += data.count
         defer { publishAudioMetrics() }
@@ -577,6 +701,11 @@ extension RemoteBluetoothManager: CBPeripheralDelegate {
             guard active?.identifier == peripheral.identifier else { return }
             if let error {
                 log("订阅 \(characteristic.uuid.uuidString) 失败：\(error.localizedDescription)")
+                if characteristic === atvvAudio {
+                    finishAudio(reason: "音频通知订阅失败")
+                    voiceStatus = "音频通知启用失败；语音键待机但不占用麦克风"
+                    return
+                }
                 if hidInputCharacteristics.contains(where: { $0 === characteristic }) {
                     bleHIDStatus = "BLE HID 通知订阅失败：\(error.localizedDescription)"
                     isBLEHIDMonitoring = false
@@ -586,6 +715,19 @@ extension RemoteBluetoothManager: CBPeripheralDelegate {
                 return
             }
             log("通知 \(characteristic.uuid.uuidString)：\(characteristic.isNotifying ? "已启用" : "已停用")")
+            if characteristic === atvvAudio {
+                if characteristic.isNotifying {
+                    if microphoneOpenPending {
+                        completePendingMicrophoneOpen()
+                    } else if !isRecording {
+                        // A late notification acknowledgement can arrive
+                        // after key-up. Immediately release its subscription.
+                        active?.setNotifyValue(false, for: characteristic)
+                    }
+                } else if !isRecording && !microphoneOpenPending {
+                    audioChannelActive = false
+                }
+            }
             if hidInputCharacteristics.contains(where: { $0 === characteristic }) && isBLEHIDMonitoring {
                 bleHIDStatus = characteristic.isNotifying
                     ? "正在接收 BLE HID 通知（非独占；能否实际收到按键待测试）"
@@ -602,8 +744,16 @@ extension RemoteBluetoothManager: CBPeripheralDelegate {
             guard let value = characteristic.value else { return }
             switch characteristic.uuid {
             case ATVV.control:
-                onATVVControlReport?(value)
-                processControl(value)
+                if value.first == 0x00 {
+                    // On key-up, close BLE audio and AudioQueue before the
+                    // HID callback releases Doubao and restores Mac input.
+                    processControl(value)
+                    onATVVControlReport?(value)
+                } else {
+                    // On key-down, switch Mac input before MIC_OPEN arrives.
+                    onATVVControlReport?(value)
+                    processControl(value)
+                }
             case ATVV.audio: processAudio(value)
             default:
                 guard isBLEHIDMonitoring,

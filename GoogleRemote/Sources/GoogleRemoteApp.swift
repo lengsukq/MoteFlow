@@ -48,7 +48,8 @@ private struct RemoteMenuBarContent: View {
               systemImage: hidCapture.isExclusive ? "checkmark.shield.fill" : "keyboard")
         Label(bluetooth.connectedDeviceID != nil ? "语音 BLE 已连接" : "语音 BLE 未连接",
               systemImage: "waveform")
-        Text(bluetooth.voiceModeEnabled ? "ATVV 接收已启用" : "ATVV 接收未启用")
+        Text(bluetooth.audioChannelActive ? "ATVV 音频采集中" :
+                bluetooth.voiceModeEnabled ? "ATVV 按键待机 · 麦克风未占用" : "ATVV 监听已关闭")
         Divider()
         Button("打开控制台") { runtime.openMainWindow { openWindow(id: "main") } }
             .keyboardShortcut("o")
@@ -62,12 +63,13 @@ private struct RemoteMenuBarContent: View {
         Button(hidCapture.executeHardwareActions ? "暂停动作执行" : "允许动作执行") {
             if hidCapture.executeHardwareActions {
                 actionRunner.endVoiceShortcutHold()
+                bluetooth.stopCurrentVoiceSession()
                 bluetooth.virtualMicrophone.finishVoiceInputWindow()
             }
             hidCapture.executeHardwareActions.toggle()
         }
         Divider()
-        Button(bluetooth.voiceModeEnabled ? "关闭语音接收" : "启用语音接收") {
+        Button(bluetooth.voiceModeEnabled ? "关闭语音键监听" : "启用语音键监听") {
             bluetooth.toggleVoiceMode()
         }
         .disabled(!bluetooth.canEnableVoiceMode)
@@ -79,6 +81,7 @@ private struct RemoteMenuBarContent: View {
         Divider()
         Button("彻底退出 MoteFlow") {
             actionRunner.endVoiceShortcutHold()
+            bluetooth.stopVoiceMode()
             bluetooth.virtualMicrophone.restoreInputOnShutdown()
             NSApp.terminate(nil)
         }

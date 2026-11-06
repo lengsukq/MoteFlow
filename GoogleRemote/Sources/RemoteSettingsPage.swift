@@ -57,7 +57,8 @@ struct RemoteSettingsPage: View {
                     .toggleStyle(.switch)
                     Toggle("允许实体按键执行已绑定的快捷键或脚本", isOn: $monitor.executeHardwareActions)
                         .toggleStyle(.switch)
-                    Toggle("自动连接上次的 BLE 遥控器并启用 ATVV 语音接收", isOn: $bluetooth.autoVoiceConnectEnabled)
+                    Toggle("自动连接遥控器，语音键待机（音频按需启动）",
+                           isOn: $bluetooth.autoVoiceConnectEnabled)
                         .toggleStyle(.switch)
                     Text(bluetooth.voiceStatus)
                         .font(.system(size: 11))

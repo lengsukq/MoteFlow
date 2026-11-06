@@ -8,11 +8,12 @@
 
 ## 图标
 
-- 主图标：圆角紫蓝背景、青色流线、白色遥控器与无线信号；用于 Finder、Dock、启动器及系统权限窗口。
+- 主图标：用户确认的蓝色到青绿色渐变、白色直立遥控器、两段无线信号和柔和曲线；用于 Finder、Dock、启动器及系统权限窗口。
 - 页面标志：与 AppIcon 同源的小图，资源名 `MoteFlowMark`。
-- 菜单栏：无彩色背景的单色模板，资源名 `MoteFlowStatusIcon`，支持系统菜单栏明暗主题。
+- 菜单栏：与遥控器无线信号一致的单色模板，资源名 `MoteFlowStatusIcon`，支持系统菜单栏明暗主题。
 - 高分辨率 AppIcon：16、32、128、256、512 pt 的 1x / 2x PNG，最高 1024 × 1024，编译为 `Assets.car`。源文件位于 `GoogleRemote/Assets.xcassets/`。
-- 重生成命令：`python3 scripts/generate_brand_assets.py`。只依赖系统 AppKit/Quartz，不下载字体或第三方图标。
+- 确认过的图标原始工作源文件：`GoogleRemote/Branding/MoteFlow-Approved.webp`。重生成命令：`python3 scripts/generate_brand_assets.py`，直接缩放同一张图到全部 AppIcon 及 `MoteFlowMark`，不再生成上一版紫蓝倾斜遥控器图标。该项目工作源文件为用户提供图像的优化压缩版本。
+- 图标生成仅依赖系统 AppKit/Quartz，不下载字体或第三方图标。
 
 ## 构建与旧版本
 

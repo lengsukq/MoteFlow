@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Rebuild MoteFlow's native macOS icon assets using AppKit vector drawing.
+"""Generate MoteFlow's macOS assets from the approved icon artwork.
 
 All output stays inside the Xcode asset catalog. Run on macOS:
     python3 scripts/generate_brand_assets.py
 
-The logo is a compact hand-held remote with wireless arcs and an ocean-blue
-flow ribbon. No third-party fonts, downloads, or image dependencies are used.
+Source: GoogleRemote/Branding/MoteFlow-Approved.webp (approved blue/cyan remote icon).
+Do not redraw or substitute the formerly used purple/tilted remote.
+The status-bar template is drawn separately because macOS menu-bar icons
+need a monochrome shape, unlike the full-colour Dock icon.
 """
 
 import json
+import hashlib
 from pathlib import Path
 
 from AppKit import (
@@ -16,7 +19,8 @@ from AppKit import (
     NSBezierPath,
     NSBitmapImageRep,
     NSColor,
-    NSGradient,
+    NSImage,
+    NSCompositingOperationSourceOver,
     NSGraphicsContext,
     NSBitmapImageFileTypePNG,
     NSDeviceRGBColorSpace,
@@ -25,6 +29,7 @@ from Foundation import NSMakePoint, NSMakeRect
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG = ROOT / "GoogleRemote" / "Assets.xcassets"
+SOURCE_ICON = ROOT / "GoogleRemote" / "Branding" / "MoteFlow-Approved.webp"
 
 
 def color(red, green, blue, alpha=1):
@@ -88,56 +93,19 @@ def write_bitmap(rep, path):
 
 
 def draw_icon(size, path):
+    """Rasterize the user-approved image into a native PNG AppIcon slot."""
+    if not SOURCE_ICON.is_file():
+        raise FileNotFoundError(f"Approved icon artwork not found: {SOURCE_ICON}")
+    source_image = NSImage.alloc().initWithContentsOfFile_(str(SOURCE_ICON))
+    if source_image is None:
+        raise RuntimeError(f"Cannot decode approved icon artwork: {SOURCE_ICON}")
     rep = canvas(size)
-
-    # Square macOS icon with a gentle optical margin and curved corners.
-    base = rounded(40, 40, 944, 944, 228)
-    NSGradient.alloc().initWithStartingColor_endingColor_(
-        color(23, 43, 112), color(97, 64, 225)
-    ).drawInBezierPath_angle_(base, 132)
-
-    # Subtle upper-light gradient (deliberately no noisy texture).
-    glow = rounded(72, 485, 880, 470, 194)
-    NSGradient.alloc().initWithStartingColor_endingColor_(
-        color(99, 132, 255, 0.22), color(45, 77, 185, 0.00)
-    ).drawInBezierPath_angle_(glow, 100)
-
-    # The flowing cyan band links remote control and automation.
-    flow = NSBezierPath.bezierPath()
-    flow.moveToPoint_(NSMakePoint(40, 250))
-    flow.curveToPoint_controlPoint1_controlPoint2_(
-        NSMakePoint(984, 276), NSMakePoint(330, 395), NSMakePoint(640, 125)
+    source_image.drawInRect_fromRect_operation_fraction_(
+        NSMakeRect(0, 0, 1024, 1024),
+        NSMakeRect(0, 0, 0, 0),
+        NSCompositingOperationSourceOver,
+        1.0
     )
-    flow.lineToPoint_(NSMakePoint(984, 95))
-    flow.lineToPoint_(NSMakePoint(40, 95))
-    flow.closePath()
-    NSGradient.alloc().initWithStartingColor_endingColor_(
-        color(25, 211, 243, 0.89), color(111, 109, 250, 0.54)
-    ).drawInBezierPath_angle_(flow, 6)
-
-    # Remote silhouette; small tilt gives motion without sacrificing legibility.
-    rotate = NSAffineTransform.transform()
-    rotate.translateXBy_yBy_(515, 470)
-    rotate.rotateByDegrees_(-14)
-    rotate.translateXBy_yBy_(-515, -470)
-    rotate.concat()
-
-    remote_shadow = rounded(392, 202, 270, 494, 129)
-    fill(remote_shadow, color(11, 19, 66, 0.25))
-    remote = rounded(378, 218, 270, 494, 129)
-    NSGradient.alloc().initWithStartingColor_endingColor_(
-        color(255, 255, 255), color(207, 224, 255)
-    ).drawInBezierPath_angle_(remote, 80)
-    fill(ellipse(453, 504, 122, 122), color(58, 59, 171))
-    fill(ellipse(478, 529, 72, 72), color(127, 170, 255, 0.67))
-    fill(ellipse(475, 382, 69, 69), color(72, 75, 174))
-    fill(ellipse(488, 300, 28, 28), color(83, 94, 187))
-    fill(ellipse(537, 300, 28, 28), color(83, 94, 187))
-    fill(ellipse(463, 300, 28, 28), color(83, 94, 187))
-
-    # Wireless signal glows above the remote, still crisp at 32px.
-    arc(513, 706, 65, 43, 137, color(241, 249, 255), 30)
-    arc(513, 703, 131, 43, 137, color(164, 234, 255), 29)
     write_bitmap(rep, path)
 
 
@@ -164,8 +132,7 @@ def main():
             physical_size = logical_size * scale
             filename = f"mote-flow-{physical_size}.png"
             destination = appicon / filename
-            if not destination.exists():
-                draw_icon(physical_size, destination)
+            draw_icon(physical_size, destination)
             appicons.append({
                 "idiom": "mac",
                 "size": f"{logical_size}x{logical_size}",
@@ -191,6 +158,8 @@ def main():
         "info": {"author": "xcode", "version": 1},
         "properties": {"template-rendering-intent": "template"},
     })
+    print(f"Approved source: {SOURCE_ICON.name}")
+    print(f"Source SHA256: {hashlib.sha256(SOURCE_ICON.read_bytes()).hexdigest()}")
     print(f"Generated MoteFlow icon set, brand mark and menu-bar glyph in {CATALOG}")
 
 

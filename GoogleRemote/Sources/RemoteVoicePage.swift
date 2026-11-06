@@ -226,8 +226,12 @@ struct RemoteVoicePage: View {
                         Spacer(minLength: 4)
                         if bluetooth.isRecording {
                             RemoteStatusPill(title: "正在接收", symbol: "record.circle", tint: RemotePalette.positive)
+                        } else if bluetooth.audioChannelActive {
+                            RemoteStatusPill(title: "正在开启麦克风", symbol: "hourglass",
+                                             tint: RemotePalette.amber)
                         } else {
-                            RemoteStatusPill(title: "待机", symbol: "pause.circle", tint: .secondary)
+                            RemoteStatusPill(title: "待机 · 麦克风已关闭", symbol: "pause.circle",
+                                             tint: .secondary)
                         }
                     }
 
@@ -246,7 +250,7 @@ struct RemoteVoicePage: View {
                     HStack(alignment: .center, spacing: 9) {
                         Image(systemName: "info.circle")
                             .foregroundStyle(RemotePalette.indigo)
-                        Text("按实体遥控器的语音键开始录音，结束后可导出 WAV。接收链路仍需真机验证。")
+                        Text("待机时仅监听语音键，不占用音频通道。按实体语音键才开始录音，松开、停止或超时即释放；结束后可导出 WAV。")
                             .font(.system(size: 11)).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         Spacer(minLength: 0)
@@ -388,7 +392,7 @@ struct RemoteVoicePage: View {
             Button {
                 bluetooth.toggleVoiceMode()
             } label: {
-                Label(bluetooth.voiceModeEnabled ? "关闭语音接收" : "启用语音接收",
+                Label(bluetooth.voiceModeEnabled ? "停止语音键监听" : "启用语音键监听",
                       systemImage: bluetooth.voiceModeEnabled ? "stop.circle" : "mic.circle")
             }
             .buttonStyle(RemoteActionButtonStyle(emphasized: !bluetooth.voiceModeEnabled))
