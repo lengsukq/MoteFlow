@@ -48,7 +48,8 @@ private struct RemoteMenuBarContent: View {
               systemImage: hidCapture.isExclusive ? "checkmark.shield.fill" : "keyboard")
         Label(bluetooth.connectedDeviceID != nil ? "语音 BLE 已连接" : "语音 BLE 未连接",
               systemImage: "waveform")
-        Text(bluetooth.audioChannelActive ? "ATVV 音频采集中" :
+        Text(bluetooth.isRecording ? "ATVV 正在采集语音" :
+                bluetooth.audioChannelActive ? "ATVV 正在打开音频通道" :
                 bluetooth.voiceModeEnabled ? "ATVV 按键待机 · 麦克风未占用" : "ATVV 监听已关闭")
         Divider()
         Button("打开控制台") { runtime.openMainWindow { openWindow(id: "main") } }

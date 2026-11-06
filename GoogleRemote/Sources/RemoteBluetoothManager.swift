@@ -321,8 +321,11 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(800))
                 guard !Task.isCancelled, let self, self.isRecording else { return }
-                if let last = self.lastVoicePacketAt, Date().timeIntervalSince(last) >= 3 {
-                    self.log("音频超过 3 秒未送达，关闭当前语音会话以防占用麦克风")
+                if let last = self.lastVoicePacketAt, Date().timeIntervalSince(last) >= 12 {
+                    // This is a lost-stream guard, not a fixed voice-recording
+                    // duration. Long pauses while the remote still transmits
+                    // silence must not prematurely release the push-to-talk.
+                    self.log("音频超过 12 秒未送达，关闭失联会话以防占用麦克风")
                     self.stopCurrentVoiceSession()
                     return
                 }

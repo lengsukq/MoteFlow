@@ -506,7 +506,7 @@ struct RemoteVirtualMicrophoneSettings: View {
                             )
                         }
                     }
-                    Toggle("把遥控器语音实时送到所选虚拟麦克风", isOn: $router.isEnabled)
+                    Toggle("允许按语音键时使用虚拟麦克风（待机不占用）", isOn: $router.isEnabled)
                         .toggleStyle(.switch)
                         .disabled(router.selectedUID.isEmpty ||
                                   !router.devices.contains(where: { $0.id == router.selectedUID }))
