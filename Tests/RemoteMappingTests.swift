@@ -16,6 +16,39 @@ final class RemoteMappingTests: XCTestCase {
         XCTAssertEqual(shortcut.display, "⌘⇧K")
     }
 
+    func testPhysicalHoldRepeatPolicySupportsDeleteButNotModifierShortcuts() {
+        let delete = RemoteShortcut(keyCode: 51, keyLabel: "Delete",
+                                    command: false, shift: false, option: false, control: false)
+        XCTAssertTrue(RemoteKeyRepeatPolicy.shouldRepeat(delete))
+        var shiftedDelete = delete
+        shiftedDelete.shift = true
+        XCTAssertTrue(RemoteKeyRepeatPolicy.shouldRepeat(shiftedDelete))
+        var commandDelete = delete
+        commandDelete.command = true
+        XCTAssertFalse(RemoteKeyRepeatPolicy.shouldRepeat(commandDelete))
+        var optionDelete = delete
+        optionDelete.option = true
+        XCTAssertFalse(RemoteKeyRepeatPolicy.shouldRepeat(optionDelete))
+        var controlDelete = delete
+        controlDelete.control = true
+        XCTAssertFalse(RemoteKeyRepeatPolicy.shouldRepeat(controlDelete))
+        let commandOnly = RemoteShortcut(keyCode: 55, keyLabel: "Command",
+                                         command: false, shift: false, option: false, control: false)
+        XCTAssertFalse(RemoteKeyRepeatPolicy.shouldRepeat(commandOnly))
+    }
+
+    func testPhysicalHoldRepeatTimingHonorsSystemPreferencesSafely() {
+        let suite = "MoteFlow.test.repeat-preferences.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { XCTFail(); return }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(18, forKey: "InitialKeyRepeat")
+        defaults.set(3, forKey: "KeyRepeat")
+        XCTAssertEqual(RemoteKeyRepeatPolicy.initialDelay(defaults: defaults), 0.3, accuracy: 0.0001)
+        XCTAssertEqual(RemoteKeyRepeatPolicy.repeatInterval(defaults: defaults), 0.05, accuracy: 0.0001)
+        defaults.set(0, forKey: "KeyRepeat")
+        XCTAssertEqual(RemoteKeyRepeatPolicy.repeatInterval(defaults: defaults), 0.025, accuracy: 0.0001)
+    }
+
     func testInitialCommitATVVCommandFramesRemainCompatible() {
         XCTAssertEqual(ATVV.getCapabilities, Data([0x0A, 0x01, 0x00, 0x00, 0x03, 0x03]))
         XCTAssertEqual(ATVV.micOpen(codec: 0x0001), Data([0x0C, 0x00, 0x01]))

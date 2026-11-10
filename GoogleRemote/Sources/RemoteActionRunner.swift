@@ -43,8 +43,9 @@ final class RemoteActionRunner: ObservableObject {
     @Published private(set) var voiceShortcutHeld = false
     private var voiceKeyUp: CGEvent?
     private var heldVoiceShortcut: RemoteShortcut?
-    private var mappedHold: (key: RemoteKey, shortcut: RemoteShortcut, keyUp: CGEvent)?
+    private var mappedHold: (id: UUID, key: RemoteKey, shortcut: RemoteShortcut, keyUp: CGEvent)?
     private var mappedHoldWatchdog: Task<Void, Never>?
+    private var mappedRepeatTask: Task<Void, Never>?
     private var pendingMappedActions: [(action: RemoteAction, label: String, library: RemoteLibraryStore)] = []
 
     private static func flags(for shortcut: RemoteShortcut) -> CGEventFlags {
@@ -185,10 +186,12 @@ final class RemoteActionRunner: ObservableObject {
             return false
         }
         Self.configureMainKeyEvents(down, up, shortcut: shortcut)
-        mappedHold = (key, shortcut, up)
+        let holdID = UUID()
+        mappedHold = (holdID, key, shortcut, up)
         Self.postPhysicalModifiers(shortcut, pressing: true)
         down.post(tap: .cghidEventTap)
         result = "实体「\(key.title)」正在按住 \(shortcut.display)，松开遥控器即释放"
+        startMappedKeyRepeat(shortcut, for: holdID)
         // Failsafe only: if the remote never reports key-up, do not leave a
         // key logically down forever. Ordinary releases have no fixed duration.
         mappedHoldWatchdog?.cancel()
@@ -202,6 +205,9 @@ final class RemoteActionRunner: ObservableObject {
 
     func endMappedShortcutHold(for key: RemoteKey? = nil) {
         guard let held = mappedHold, key == nil || held.key == key else { return }
+        // Cancel before keyUp so no repeat can be emitted after release.
+        mappedRepeatTask?.cancel()
+        mappedRepeatTask = nil
         mappedHoldWatchdog?.cancel()
         mappedHoldWatchdog = nil
         mappedHold = nil
@@ -209,6 +215,33 @@ final class RemoteActionRunner: ObservableObject {
         Self.postPhysicalModifiers(held.shortcut, pressing: false)
         result = "已随实体「\(held.key.title)」松开而释放 \(held.shortcut.display)"
         drainMappedActions()
+    }
+
+    /// Synthetic CGEvent keyDown is not auto-repeated by macOS. Post explicit
+    /// keyDown events marked as repeats, using the user's keyboard repeat
+    /// preferences, until the physical remote sends key-up.
+    private func startMappedKeyRepeat(_ shortcut: RemoteShortcut, for holdID: UUID) {
+        mappedRepeatTask?.cancel()
+        mappedRepeatTask = nil
+        guard RemoteKeyRepeatPolicy.shouldRepeat(shortcut) else { return }
+        let initialDelay = RemoteKeyRepeatPolicy.initialDelay()
+        let interval = RemoteKeyRepeatPolicy.repeatInterval()
+        mappedRepeatTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(initialDelay)) }
+            catch { return }
+            while !Task.isCancelled {
+                guard let self, let held = self.mappedHold, held.id == holdID else { return }
+                if let repeatedDown = CGEvent(
+                    keyboardEventSource: nil, virtualKey: held.shortcut.keyCode, keyDown: true
+                ) {
+                    repeatedDown.flags = Self.flags(for: held.shortcut)
+                    repeatedDown.setIntegerValueField(.keyboardEventAutorepeat, value: 1)
+                    repeatedDown.post(tap: .cghidEventTap)
+                }
+                do { try await Task.sleep(for: .seconds(interval)) }
+                catch { return }
+            }
+        }
     }
 
     /// HID releases can arrive much faster than the macOS key-up timer.

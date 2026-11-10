@@ -627,7 +627,7 @@ struct RemoteMappingPage: View {
                         }
                         .pickerStyle(.segmented)
                         Text(action.effectiveHoldMode == .physical
-                             ? "实体遥控器按住超过上方判定阈值时，Mac 开始按住目标键；实体键松开就立即释放，不再按固定秒数。仅限单个键盘快捷键（含单步骤动作库）。"
+                             ? "超过长按阈值后持续按住目标键；Delete、方向键等普通按键会按 macOS 键盘重复速度连续执行，松开立即停止。Command / Option / Control 快捷键只触发一次以避免误操作。支持单步骤键盘动作库。"
                              : "使用已设置的目标键固定按住时长；实体遥控器释放后执行。")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)

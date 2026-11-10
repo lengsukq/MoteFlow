@@ -22,6 +22,27 @@ enum DoubaoShortcutTrigger: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+/// CGEvent keyDown alone does not produce hardware keyboard autorepeat.
+/// Repeat plain editing/navigation keys while held, but never automatically
+/// re-trigger potentially destructive Command/Option/Control shortcuts.
+enum RemoteKeyRepeatPolicy {
+    static func shouldRepeat(_ shortcut: RemoteShortcut) -> Bool {
+        !shortcut.isModifierOnly && !shortcut.command && !shortcut.option && !shortcut.control
+    }
+
+    /// macOS stores keyboard repeat preferences as 60 Hz ticks.
+    /// Fallback values apply when the user has not customized these settings.
+    static func initialDelay(defaults: UserDefaults = .standard) -> Double {
+        guard let ticks = defaults.object(forKey: "InitialKeyRepeat") as? NSNumber else { return 0.40 }
+        return min(1.5, max(0.15, ticks.doubleValue / 60))
+    }
+
+    static func repeatInterval(defaults: UserDefaults = .standard) -> Double {
+        guard let ticks = defaults.object(forKey: "KeyRepeat") as? NSNumber else { return 0.055 }
+        return min(0.30, max(0.025, ticks.doubleValue / 60))
+    }
+}
+
 /// The physical button inventory of the original Chromecast Voice Remote (G9N9N).
 /// Buttons are kept distinct from HID usages, which still require hardware verification.
 enum RemoteKey: String, CaseIterable, Codable, Identifiable {
