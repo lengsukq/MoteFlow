@@ -24,6 +24,7 @@ from AppKit import (
     NSGraphicsContext,
     NSBitmapImageFileTypePNG,
     NSDeviceRGBColorSpace,
+    NSEvenOddWindingRule,
 )
 from Foundation import NSMakePoint, NSMakeRect
 
@@ -110,12 +111,25 @@ def draw_icon(size, path):
 
 
 def draw_status(size, path):
+    """Make a true 18pt menu-bar template from the approved logo's motif.
+
+    Preserve its remote, circular primary key, four secondary keys and two
+    radio arcs. Unlike the Dock icon, use a transparent, monochrome silhouette
+    with transparent button cutouts so macOS can tint it for dark/light mode.
+    """
     rep = canvas(size)
     monochrome = NSColor.blackColor()
-    # Menu-bar template mark: remote + two signal waves, no background.
-    fill(rounded(430, 125, 180, 570, 85), monochrome)
-    arc(520, 700, 106, 48, 132, monochrome, 55)
-    arc(520, 696, 185, 47, 133, monochrome, 48)
+    body = NSBezierPath.bezierPath()
+    body.setWindingRule_(NSEvenOddWindingRule)
+    body.appendBezierPath_(rounded(339, 103, 346, 555, 135))
+    # Cutouts must be transparent, not painted white; this is a template image.
+    body.appendBezierPath_(ellipse(445, 467, 134, 134))
+    for x in (438, 549):
+        for y in (246, 320):
+            body.appendBezierPath_(ellipse(x, y, 39, 39))
+    fill(body, monochrome)
+    arc(512, 660, 141, 48, 132, monochrome, 72)
+    arc(512, 665, 232, 48, 132, monochrome, 62)
     write_bitmap(rep, path)
 
 
@@ -152,9 +166,18 @@ def main():
     })
 
     status = CATALOG / "MoteFlowStatusIcon.imageset"
-    draw_status(64, status / "mote-flow-status.png")
+    # 18 pt is the intended AppKit menu-bar size. Using a lone 64px 1x asset
+    # gave the icon a 64pt intrinsic size and made it look oversized/cropped.
+    status_images = []
+    for scale in (1, 2, 3):
+        filename = f"mote-flow-status-{scale}x.png"
+        draw_status(18 * scale, status / filename)
+        status_images.append({
+            "idiom": "universal", "filename": filename, "scale": f"{scale}x",
+        })
+    (status / "mote-flow-status.png").unlink(missing_ok=True)
     write_json(status / "Contents.json", {
-        "images": [{"idiom": "universal", "filename": "mote-flow-status.png"}],
+        "images": status_images,
         "info": {"author": "xcode", "version": 1},
         "properties": {"template-rendering-intent": "template"},
     })
