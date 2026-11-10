@@ -172,7 +172,7 @@ final class RemoteLibraryStore: ObservableObject {
     /// Missing references must fail closed. No recursive references allowed.
     func steps(for remoteAction: RemoteAction) -> [RemoteActionStep]? {
         switch remoteAction.kind {
-        case .none, .voiceInput: return nil
+        case .none, .voiceInput, .systemAction: return nil
         case .libraryAction: return action(remoteAction.presetID)?.steps
         case .keyboardShortcut:
             guard let shortcut = remoteAction.shortcut else { return nil }

@@ -34,6 +34,7 @@ extension RemoteBindingKind {
         switch self {
         case .none: "无动作"
         case .keyboardShortcut: "键盘按键"
+        case .systemAction: "系统动作"
         case .libraryAction: "动作库"
         case .script: "本地脚本"
         case .voiceInput: "语音输入"
@@ -44,6 +45,7 @@ extension RemoteBindingKind {
         switch self {
         case .none: "circle.slash"
         case .keyboardShortcut: "keyboard"
+        case .systemAction: "gearshape.2"
         case .libraryAction: "square.stack.3d.up"
         case .script: "terminal"
         case .voiceInput: "waveform"
@@ -54,6 +56,7 @@ extension RemoteBindingKind {
         switch self {
         case .none: "不触发系统动作"
         case .keyboardShortcut: "单键、组合或修饰键"
+        case .systemAction: "调用 macOS 原生功能"
         case .libraryAction: "使用已保存动作"
         case .script: "运行已授权脚本"
         case .voiceInput: "ATVV 专用，待接入"

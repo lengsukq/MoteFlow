@@ -16,6 +16,280 @@ final class RemoteMappingTests: XCTestCase {
         XCTAssertEqual(shortcut.display, "⌘⇧K")
     }
 
+    func testGoogleFactoryProfileDirectionsTapOnceAndLongPressContinuous() {
+        let defaults = RemoteBindingStore.factoryActionBindings(for: .googleG9N9N)
+        let directions: [(RemoteKey, UInt16)] = [
+            (.up, 126), (.down, 125), (.left, 123), (.right, 124)
+        ]
+        for (key, code) in directions {
+            guard let mapping = defaults[key] else {
+                XCTFail("Missing factory mapping for \(key)")
+                continue
+            }
+            let tap = mapping.action(for: .tap)
+            let hold = mapping.action(for: .longPress)
+            XCTAssertEqual(tap.kind, .keyboardShortcut)
+            XCTAssertEqual(tap.shortcut?.keyCode, code)
+            XCTAssertEqual(tap.effectiveHoldMode, .timed)
+            XCTAssertEqual(hold.kind, .keyboardShortcut)
+            XCTAssertEqual(hold.shortcut?.keyCode, code)
+            XCTAssertEqual(hold.effectiveHoldMode, .physical)
+            XCTAssertEqual(mapping.effectiveThreshold, 0.35)
+            XCTAssertTrue(RemoteKeyRepeatPolicy.shouldRepeat(hold.shortcut!))
+        }
+        XCTAssertEqual(defaults[.select]?.shortcut?.keyCode, 36)
+        XCTAssertEqual(defaults[.back]?.shortcut?.keyCode, 53)
+        XCTAssertEqual(defaults.count, 8, "Only navigation and clipboard side keys should be preassigned")
+        XCTAssertEqual(defaults[.volumeUp]?.action(for: .tap).systemAction, .copy)
+        XCTAssertEqual(defaults[.volumeUp]?.action(for: .longPress).systemAction, .selectAllAndCopy)
+        XCTAssertEqual(defaults[.volumeDown]?.action(for: .tap).systemAction, .paste)
+        XCTAssertEqual(defaults[.volumeDown]?.action(for: .longPress).systemAction, .selectAllAndPaste)
+        XCTAssertNil(defaults[.power])
+        XCTAssertNil(defaults[.assistant])
+        XCTAssertNil(defaults[.youtube])
+    }
+
+    func testGoogleSideClipboardActionsAreAtomicOrderedNativeCommands() {
+        XCTAssertEqual(RemoteSystemAction.copy.executionSequence, [.copy])
+        XCTAssertEqual(RemoteSystemAction.paste.executionSequence, [.paste])
+        XCTAssertEqual(RemoteSystemAction.selectAllAndCopy.executionSequence,
+                       [.selectAll, .copy])
+        XCTAssertEqual(RemoteSystemAction.selectAllAndPaste.executionSequence,
+                       [.selectAll, .paste])
+        XCTAssertTrue(RemoteSystemAction.selectAllAndCopy.usesAccessibilityMenu)
+        XCTAssertTrue(RemoteSystemAction.selectAllAndPaste.usesAccessibilityMenu)
+        XCTAssertNil(RemoteSystemAction.selectAllAndCopy.screenshotArguments)
+    }
+
+    func testSideKeysMigrateOnlyWhenUnmappedAndDoNotClobberCustomActions() throws {
+        let suite = "MoteFlow.side-key-migration.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { XCTFail(); return }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let previous = [
+            RemoteKey.home: RemoteBinding(kind: .keyboardShortcut, shortcut: shortcut),
+            .volumeUp: RemoteBinding(kind: .systemAction, systemAction: .undo)
+        ]
+        defaults.set(try JSONEncoder().encode(
+            [RemoteDeviceModel.googleG9N9N.id: previous]
+        ), forKey: "MoteFlow.remoteModels.v1")
+        let store = RemoteBindingStore(defaults: defaults)
+        XCTAssertEqual(store.action(for: .volumeUp, gesture: .tap).systemAction, .undo)
+        XCTAssertEqual(store.action(for: .volumeUp, gesture: .longPress).kind, .none)
+        XCTAssertEqual(store.action(for: .volumeDown, gesture: .tap).systemAction, .paste)
+        XCTAssertEqual(store.action(for: .volumeDown, gesture: .longPress).systemAction,
+                       .selectAllAndPaste)
+        XCTAssertEqual(store.action(for: .home, gesture: .tap).shortcut, shortcut)
+
+        XCTAssertTrue(store.saveAsNamedProfile("之前的侧键"))
+        let savedID = store.activeProfileID!
+        XCTAssertTrue(store.applyGoogleSideKeyClipboardPreset())
+        XCTAssertEqual(store.action(for: .volumeUp, gesture: .tap).systemAction, .copy)
+        XCTAssertEqual(store.action(for: .volumeUp, gesture: .longPress).systemAction,
+                       .selectAllAndCopy)
+        XCTAssertTrue(store.hasUnsavedNamedChanges)
+        XCTAssertEqual(store.activeNamedProfile?.bindings[.volumeUp]?.systemAction, .undo)
+        XCTAssertEqual(RemoteBindingStore(defaults: defaults)
+            .action(for: .volumeDown, gesture: .longPress).systemAction, .selectAllAndPaste)
+        XCTAssertTrue(store.applyNamedProfile(savedID))
+        XCTAssertEqual(store.action(for: .volumeUp, gesture: .tap).systemAction, .undo)
+        store.applyFactoryMapping()
+        XCTAssertEqual(store.action(for: .volumeUp, gesture: .tap).systemAction, .copy)
+        XCTAssertEqual(store.action(for: .volumeDown, gesture: .longPress).systemAction,
+                       .selectAllAndPaste)
+    }
+
+    func testSideKeyMigrationNeverReaddsKeysAfterUserClearsThem() {
+        let suite = "MoteFlow.side-key-clear.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { XCTFail(); return }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = RemoteBindingStore(defaults: defaults)
+        store.reset(.volumeUp)
+        let reloaded = RemoteBindingStore(defaults: defaults)
+        XCTAssertEqual(reloaded.action(for: .volumeUp, gesture: .tap).kind, .none)
+        XCTAssertEqual(reloaded.action(for: .volumeUp, gesture: .longPress).kind, .none)
+        XCTAssertEqual(reloaded.action(for: .volumeDown, gesture: .tap).systemAction, .paste)
+        reloaded.selectModel(.xiaomiRemote2)
+        XCTAssertFalse(reloaded.applyGoogleSideKeyClipboardPreset())
+    }
+
+    func testNamedMappingProfilesAreSeparateSnapshotsAndFactoryCanAlwaysRestore() {
+        let suite = "MoteFlow.mapping-profiles.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { XCTFail(); return }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = RemoteBindingStore(defaults: defaults)
+        XCTAssertEqual(store.activeModel, .googleG9N9N)
+        XCTAssertEqual(store.configuredCount, 8)
+        XCTAssertNil(store.activeNamedProfile)
+
+        store.setLongPressThreshold(0.8, for: .up)
+        XCTAssertTrue(store.saveAsNamedProfile(" 我的客厅 "), store.profileError ?? "")
+        let id = store.activeProfileID!
+        XCTAssertEqual(store.activeNamedProfile?.name, "我的客厅")
+        XCTAssertFalse(store.hasUnsavedNamedChanges)
+        XCTAssertFalse(store.saveAsNamedProfile("我的客厅"))
+        XCTAssertFalse(store.saveAsNamedProfile("   "))
+        XCTAssertEqual(store.profilesForActiveModel.count, 1)
+
+        store.setLongPressThreshold(1.1, for: .up)
+        XCTAssertTrue(store.hasUnsavedNamedChanges)
+        let reloadedDirty = RemoteBindingStore(defaults: defaults)
+        XCTAssertEqual(reloadedDirty.activeProfileID, id)
+        XCTAssertTrue(reloadedDirty.hasUnsavedNamedChanges)
+        XCTAssertEqual(reloadedDirty.binding(for: .up).effectiveThreshold, 1.1)
+        XCTAssertEqual(reloadedDirty.activeNamedProfile?.bindings[.up]?.effectiveThreshold, 0.8)
+
+        store.applyFactoryMapping()
+        XCTAssertNil(store.activeProfileID)
+        XCTAssertEqual(store.binding(for: .up).effectiveThreshold, 0.35)
+        XCTAssertEqual(store.profilesForActiveModel.count, 1)
+        XCTAssertTrue(store.applyNamedProfile(id))
+        XCTAssertEqual(store.binding(for: .up).effectiveThreshold, 0.8)
+        store.setLongPressThreshold(0.6, for: .up)
+        XCTAssertTrue(store.updateActiveNamedProfile())
+        XCTAssertFalse(store.hasUnsavedNamedChanges)
+        XCTAssertEqual(RemoteBindingStore(defaults: defaults)
+            .activeNamedProfile?.bindings[.up]?.effectiveThreshold, 0.6)
+
+        XCTAssertTrue(store.renameNamedProfile(id, to: "日常遥控"))
+        XCTAssertEqual(store.activeNamedProfile?.name, "日常遥控")
+        XCTAssertTrue(store.deleteNamedProfile(id))
+        XCTAssertNil(store.activeNamedProfile)
+        XCTAssertEqual(store.binding(for: .up).effectiveThreshold, 0.6,
+                       "Deleting a snapshot should not erase the current working copy")
+        store.applyFactoryMapping()
+        XCTAssertEqual(store.binding(for: .up).effectiveThreshold, 0.35,
+                       "Factory remains immutable after arbitrary custom edits")
+        XCTAssertTrue(store.profilesForActiveModel.isEmpty)
+    }
+
+    func testNamedProfilesDoNotLeakBetweenRemoteModels() {
+        let suite = "MoteFlow.model-profiles.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { XCTFail(); return }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = RemoteBindingStore(defaults: defaults)
+        store.applyFactoryMapping()
+        XCTAssertTrue(store.saveAsNamedProfile("通用方案"))
+        let googleID = store.activeProfileID!
+        store.selectModel(.xiaomiRemote2)
+        XCTAssertNil(store.activeProfileID)
+        XCTAssertTrue(store.profilesForActiveModel.isEmpty)
+        XCTAssertFalse(store.applyNamedProfile(googleID))
+        XCTAssertTrue(store.saveAsNamedProfile("通用方案"))
+        let xiaomiID = store.activeProfileID!
+        XCTAssertNotEqual(xiaomiID, googleID)
+        store.selectModel(.googleG9N9N)
+        XCTAssertEqual(store.activeProfileID, googleID)
+        XCTAssertEqual(store.profilesForActiveModel.count, 1)
+        store.applyFactoryMapping()
+        XCTAssertNil(store.activeProfileID)
+        store.selectModel(.xiaomiRemote2)
+        XCTAssertEqual(store.activeProfileID, xiaomiID)
+        XCTAssertEqual(store.profilesForActiveModel.count, 1)
+        XCTAssertEqual(RemoteBindingStore(defaults: defaults).activeProfileID, xiaomiID)
+    }
+
+    func testMacShortcutCatalogContainsExpectedSystemShortcuts() {
+        XCTAssertEqual(MacShortcutPreset.all.count, 22)
+        XCTAssertEqual(Set(MacShortcutPreset.all.map(\.id)).count, MacShortcutPreset.all.count)
+        XCTAssertEqual(MacShortcutPreset.popular.count, 6)
+        XCTAssertEqual(MacShortcutPreset.popular.map(\.id), MacShortcutPreset.popularIDs)
+
+        func preset(_ id: String) -> RemoteShortcut {
+            guard let shortcut = MacShortcutPreset.all.first(where: { $0.id == id })?.shortcut else {
+                XCTFail("Missing macOS shortcut preset \(id)")
+                return RemoteShortcut(keyCode: 0, keyLabel: "", command: false,
+                                      shift: false, option: false, control: false)
+            }
+            return shortcut
+        }
+        XCTAssertEqual(preset("screenshot.area").keyCode, 21)
+        XCTAssertEqual(preset("screenshot.area").display, "⌘⇧4")
+        XCTAssertEqual(preset("screenshot.full").display, "⌘⇧3")
+        XCTAssertEqual(preset("screenshot.toolbar").display, "⌘⇧5")
+        XCTAssertEqual(preset("screenshot.area.clipboard").display, "⌘⇧⌃4")
+        XCTAssertEqual(preset("clipboard.copy").display, "⌘C")
+        XCTAssertEqual(preset("clipboard.paste").display, "⌘V")
+        XCTAssertEqual(preset("clipboard.cut").display, "⌘X")
+        XCTAssertEqual(preset("editing.undo").display, "⌘Z")
+        XCTAssertEqual(preset("editing.redo").display, "⌘⇧Z")
+        XCTAssertEqual(preset("windows.close").display, "⌘W")
+        XCTAssertEqual(preset("system.spotlight").display, "⌘Space")
+        XCTAssertEqual(preset("system.lock").display, "⌘⌃Q")
+        XCTAssertEqual(Set(MacShortcutPreset.all.map(\.shortcut)).count,
+                       MacShortcutPreset.all.count, "Every preset should have a distinct key combination")
+    }
+
+    func testMacPresetBindingUsesNormalIndependentPersistentShortcutMapping() {
+        let suite = "MoteFlow.mac-presets.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { XCTFail(); return }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = RemoteBindingStore(defaults: defaults)
+        let copy = MacShortcutPreset.all.first { $0.id == "clipboard.copy" }!.shortcut
+        let area = MacShortcutPreset.all.first { $0.id == "screenshot.area" }!.shortcut
+        XCTAssertTrue(store.setShortcut(copy, for: .home, gesture: .tap))
+        XCTAssertTrue(store.setShortcut(area, for: .home, gesture: .longPress))
+        let saved = RemoteBindingStore(defaults: defaults)
+        XCTAssertEqual(saved.action(for: .home, gesture: .tap).shortcut, copy)
+        XCTAssertEqual(saved.action(for: .home, gesture: .longPress).shortcut, area)
+        XCTAssertEqual(saved.action(for: .home, gesture: .tap).kind, .keyboardShortcut)
+        XCTAssertEqual(saved.conflictingKey(for: copy, excluding: .back, gesture: .tap), .home)
+        XCTAssertFalse(saved.setShortcut(copy, for: .back, gesture: .tap))
+        XCTAssertEqual(saved.action(for: .home, gesture: .tap).shortcut, copy)
+    }
+
+    func testNativeSystemActionsDoNotDependOnShortcutCombinations() {
+        let nativeIDs: [String: RemoteSystemAction] = [
+            "screenshot.area": .screenshotArea,
+            "screenshot.full": .screenshotFull,
+            "screenshot.toolbar": .screenshotToolbar,
+            "screenshot.area.clipboard": .screenshotAreaClipboard,
+            "screenshot.full.clipboard": .screenshotFullClipboard,
+            "clipboard.copy": .copy,
+            "clipboard.paste": .paste,
+            "clipboard.cut": .cut,
+            "editing.undo": .undo,
+            "editing.redo": .redo,
+            "editing.selectall": .selectAll
+        ]
+        for (id, intent) in nativeIDs {
+            XCTAssertEqual(MacShortcutPreset.all.first(where: { $0.id == id })?.nativeAction, intent)
+        }
+        XCTAssertNil(MacShortcutPreset.all.first { $0.id == "system.spotlight" }?.nativeAction)
+        XCTAssertNil(MacShortcutPreset.all.first { $0.id == "windows.close" }?.nativeAction)
+        XCTAssertEqual(RemoteSystemAction.screenshotArea.screenshotArguments, ["-i", "-s", "-p"])
+        XCTAssertEqual(RemoteSystemAction.screenshotFull.screenshotArguments, ["-p"])
+        XCTAssertEqual(RemoteSystemAction.screenshotToolbar.screenshotArguments, ["-i", "-U", "-p"])
+        XCTAssertEqual(RemoteSystemAction.screenshotFullClipboard.screenshotArguments, ["-c"])
+        XCTAssertNil(RemoteSystemAction.copy.screenshotArguments)
+        XCTAssertTrue(RemoteSystemAction.paste.usesAccessibilityMenu)
+        XCTAssertFalse(RemoteSystemAction.screenshotArea.usesAccessibilityMenu)
+        XCTAssertTrue(RemoteSystemAction.copy.menuTitles.contains("复制"))
+    }
+
+    func testNativeActionsPersistAcrossGesturesWithoutMigratingLegacyShortcuts() throws {
+        let suite = "MoteFlow.native-actions.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { XCTFail(); return }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = RemoteBindingStore(defaults: defaults)
+        let key = RemoteKey.back
+        XCTAssertTrue(store.setShortcut(shortcut, for: key, gesture: .tap))
+        store.setSystemAction(.screenshotArea, for: key, gesture: .longPress)
+        let saved = RemoteBindingStore(defaults: defaults)
+        XCTAssertEqual(saved.action(for: key, gesture: .tap).shortcut, shortcut)
+        XCTAssertEqual(saved.action(for: key, gesture: .tap).kind, .keyboardShortcut)
+        XCTAssertEqual(saved.action(for: key, gesture: .longPress).kind, .systemAction)
+        XCTAssertEqual(saved.action(for: key, gesture: .longPress).systemAction, .screenshotArea)
+        saved.setSystemAction(.copy, for: key, gesture: .tap)
+        XCTAssertNil(saved.action(for: key, gesture: .tap).shortcut)
+        XCTAssertEqual(RemoteBindingStore(defaults: defaults).action(
+            for: key, gesture: .tap
+        ).systemAction, .copy)
+        let legacy = try JSONDecoder().decode(RemoteAction.self, from: Data(
+            #"{"kind":"keyboardShortcut","shortcut":{"keyCode":8,"keyLabel":"C","command":true,"shift":false,"option":false,"control":false}}"#.utf8
+        ))
+        XCTAssertNil(legacy.systemAction)
+    }
+
     func testPhysicalHoldRepeatPolicySupportsDeleteButNotModifierShortcuts() {
         let delete = RemoteShortcut(keyCode: 51, keyLabel: "Delete",
                                     command: false, shift: false, option: false, control: false)
@@ -153,6 +427,7 @@ final class RemoteMappingTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
 
         let store = RemoteBindingStore(defaults: defaults)
+        store.resetAll() // Explicitly start with an empty workspace, not factory mapping.
         XCTAssertEqual(store.configuredCount, 0)
 
         XCTAssertTrue(store.setShortcut(shortcut, for: .assistant))

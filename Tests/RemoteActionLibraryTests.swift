@@ -14,6 +14,7 @@ final class RemoteActionLibraryTests: XCTestCase {
         guard let defaults = UserDefaults(suiteName: suite) else { XCTFail(); return }
         defer { defaults.removePersistentDomain(forName: suite) }
         let store = RemoteBindingStore(defaults: defaults)
+        store.resetAll() // Exercise gesture isolation without built-in Google defaults.
         XCTAssertTrue(store.setShortcut(exampleKey, for: .home, gesture: .tap))
         XCTAssertTrue(store.setShortcut(exampleKey, for: .home, gesture: .longPress))
         store.setOutputHold(2.0, for: .home, gesture: .tap)

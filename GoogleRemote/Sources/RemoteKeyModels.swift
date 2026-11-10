@@ -22,6 +22,213 @@ enum DoubaoShortcutTrigger: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+/// Public macOS facilities and Accessibility menu commands, independent of
+/// user-customized key equivalents. Raw identifiers remain stable in JSON.
+enum RemoteSystemAction: String, Codable, CaseIterable, Identifiable {
+    case screenshotArea
+    case screenshotFull
+    case screenshotToolbar
+    case screenshotAreaClipboard
+    case screenshotFullClipboard
+    case copy
+    case paste
+    case cut
+    case selectAll
+    case selectAllAndCopy
+    case selectAllAndPaste
+    case undo
+    case redo
+
+    var id: String { rawValue }
+    /// Composite actions are executed sequentially, never repeated on hold.
+    var executionSequence: [RemoteSystemAction] {
+        switch self {
+        case .selectAllAndCopy: [.selectAll, .copy]
+        case .selectAllAndPaste: [.selectAll, .paste]
+        default: [self]
+        }
+    }
+    var title: String {
+        switch self {
+        case .screenshotArea: "区域截图"
+        case .screenshotFull: "全屏截图"
+        case .screenshotToolbar: "截图与录屏工具栏"
+        case .screenshotAreaClipboard: "区域截图到剪贴板"
+        case .screenshotFullClipboard: "全屏截图到剪贴板"
+        case .copy: "复制"
+        case .paste: "粘贴"
+        case .cut: "剪切"
+        case .selectAll: "全选"
+        case .selectAllAndCopy: "全选后复制"
+        case .selectAllAndPaste: "全选后粘贴"
+        case .undo: "撤销"
+        case .redo: "重做"
+        }
+    }
+
+    var usesAccessibilityMenu: Bool {
+        switch self {
+        case .copy, .paste, .cut, .selectAll, .selectAllAndCopy,
+             .selectAllAndPaste, .undo, .redo: true
+        default: false
+        }
+    }
+
+    var menuTitles: [String] {
+        switch self {
+        case .copy: ["Copy", "复制", "拷贝"]
+        case .paste: ["Paste", "粘贴"]
+        case .cut: ["Cut", "剪切"]
+        case .selectAll: ["Select All", "全选", "全部选择"]
+        case .selectAllAndCopy, .selectAllAndPaste: []
+        case .undo: ["Undo", "撤销"]
+        case .redo: ["Redo", "重做", "恢复"]
+        default: []
+        }
+    }
+
+    /// The system screenshot tool supports these flags without shortcut remaps.
+    var screenshotArguments: [String]? {
+        switch self {
+        case .screenshotArea: ["-i", "-s", "-p"]
+        case .screenshotFull: ["-p"]
+        case .screenshotToolbar: ["-i", "-U", "-p"]
+        case .screenshotAreaClipboard: ["-i", "-s", "-c"]
+        case .screenshotFullClipboard: ["-c"]
+        default: nil
+        }
+    }
+}
+
+/// Local catalog of standard macOS keyboard shortcuts. Choosing an entry
+/// creates a normal editable RemoteShortcut; it never executes an action.
+enum MacShortcutCategory: String, CaseIterable, Identifiable {
+    case screenshot
+    case clipboard
+    case editing
+    case windows
+    case system
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .screenshot: "截图与录屏"
+        case .clipboard: "剪贴板"
+        case .editing: "文本与编辑"
+        case .windows: "窗口与 App"
+        case .system: "系统功能"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .screenshot: "camera.viewfinder"
+        case .clipboard: "doc.on.clipboard"
+        case .editing: "text.cursor"
+        case .windows: "macwindow.on.rectangle"
+        case .system: "desktopcomputer"
+        }
+    }
+}
+
+struct MacShortcutPreset: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let detail: String
+    let symbol: String
+    let category: MacShortcutCategory
+    let shortcut: RemoteShortcut
+
+    /// Native actions are identified by intent, not by key combinations.
+    /// Remaining catalog entries still behave like editable shortcuts.
+    var nativeAction: RemoteSystemAction? {
+        switch id {
+        case "screenshot.area": .screenshotArea
+        case "screenshot.full": .screenshotFull
+        case "screenshot.toolbar": .screenshotToolbar
+        case "screenshot.area.clipboard": .screenshotAreaClipboard
+        case "screenshot.full.clipboard": .screenshotFullClipboard
+        case "clipboard.copy": .copy
+        case "clipboard.paste": .paste
+        case "clipboard.cut": .cut
+        case "editing.undo": .undo
+        case "editing.redo": .redo
+        case "editing.selectall": .selectAll
+        default: nil
+        }
+    }
+
+    private static func preset(_ id: String, _ title: String, _ detail: String,
+                               _ symbol: String, _ category: MacShortcutCategory,
+                               _ keyCode: UInt16, _ label: String,
+                               command: Bool = false, shift: Bool = false,
+                               option: Bool = false, control: Bool = false) -> Self {
+        .init(id: id, title: title, detail: detail, symbol: symbol, category: category,
+              shortcut: RemoteShortcut(keyCode: keyCode, keyLabel: label,
+                                       command: command, shift: shift,
+                                       option: option, control: control))
+    }
+
+    static let all: [Self] = [
+        preset("screenshot.area", "区域截图", "框选屏幕的一部分", "camera.viewfinder", .screenshot,
+               21, "4", command: true, shift: true),
+        preset("screenshot.full", "全屏截图", "捕捉整个屏幕", "display", .screenshot,
+               20, "3", command: true, shift: true),
+        preset("screenshot.toolbar", "截屏与录屏工具", "打开系统截屏工具栏", "record.circle", .screenshot,
+               23, "5", command: true, shift: true),
+        preset("screenshot.area.clipboard", "区域截图到剪贴板", "框选后复制到剪贴板", "square.on.square.dashed", .screenshot,
+               21, "4", command: true, shift: true, control: true),
+        preset("screenshot.full.clipboard", "全屏截图到剪贴板", "将全屏截图复制到剪贴板", "doc.on.clipboard", .screenshot,
+               20, "3", command: true, shift: true, control: true),
+
+        preset("clipboard.copy", "复制", "复制选中内容", "doc.on.doc", .clipboard,
+               8, "C", command: true),
+        preset("clipboard.paste", "粘贴", "粘贴剪贴板内容", "doc.on.clipboard", .clipboard,
+               9, "V", command: true),
+        preset("clipboard.cut", "剪切", "剪切选中内容", "scissors", .clipboard,
+               7, "X", command: true),
+
+        preset("editing.selectall", "全选", "选中当前所有内容", "selection.pin.in.out", .editing,
+               0, "A", command: true),
+        preset("editing.undo", "撤销", "撤销上一步操作", "arrow.uturn.backward", .editing,
+               6, "Z", command: true),
+        preset("editing.redo", "重做", "恢复已撤销的操作", "arrow.uturn.forward", .editing,
+               6, "Z", command: true, shift: true),
+        preset("editing.find", "查找", "查找当前窗口中的内容", "magnifyingglass", .editing,
+               3, "F", command: true),
+        preset("editing.save", "保存", "保存当前文稿", "square.and.arrow.down", .editing,
+               1, "S", command: true),
+
+        preset("windows.new", "新建窗口", "在支持的 App 中新建窗口", "macwindow.badge.plus", .windows,
+               45, "N", command: true),
+        preset("windows.tab", "新建标签页", "在支持的 App 中新建标签", "plus.rectangle.on.rectangle", .windows,
+               17, "T", command: true),
+        preset("windows.close", "关闭窗口 / 标签页", "关闭当前窗口或标签页", "xmark.square", .windows,
+               13, "W", command: true),
+        preset("windows.minimize", "最小化窗口", "将当前窗口最小化", "minus.square", .windows,
+               46, "M", command: true),
+        preset("windows.hide", "隐藏当前 App", "隐藏当前应用窗口", "eye.slash", .windows,
+               4, "H", command: true),
+        preset("windows.switch", "切换 App", "切换到上一个使用的 App", "square.on.square", .windows,
+               48, "Tab", command: true),
+
+        preset("system.spotlight", "聚焦搜索", "打开 macOS 聚焦", "magnifyingglass.circle", .system,
+               49, "Space", command: true),
+        preset("system.lock", "锁定屏幕", "锁定当前 Mac", "lock.display", .system,
+               12, "Q", command: true, control: true),
+        preset("system.quicklook", "快速查看", "Finder 中预览选中的文件", "eye", .system,
+               49, "Space")
+    ]
+
+    static let popularIDs = [
+        "screenshot.area", "screenshot.full", "clipboard.copy",
+        "clipboard.paste", "editing.undo", "editing.selectall"
+    ]
+
+    static var popular: [Self] {
+        popularIDs.compactMap { id in all.first(where: { $0.id == id }) }
+    }
+}
+
 /// CGEvent keyDown alone does not produce hardware keyboard autorepeat.
 /// Repeat plain editing/navigation keys while held, but never automatically
 /// re-trigger potentially destructive Command/Option/Control shortcuts.
@@ -70,8 +277,8 @@ enum RemoteKey: String, CaseIterable, Codable, Identifiable {
         case .input: "输入源"
         case .menu: "菜单"
         case .tv: "TV / 自定义"
-        case .volumeUp: "音量增加"
-        case .volumeDown: "音量减小"
+        case .volumeUp: "上侧键 / 音量+"
+        case .volumeDown: "下侧键 / 音量−"
         }
     }
 
@@ -303,6 +510,7 @@ struct RemoteShortcut: Codable, Hashable {
 enum RemoteBindingKind: String, Codable, CaseIterable, Identifiable {
     case none
     case keyboardShortcut
+    case systemAction
     case script
     case libraryAction
     case voiceInput
@@ -313,6 +521,7 @@ enum RemoteBindingKind: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .none: "不执行动作"
         case .keyboardShortcut: "按键 / 组合快捷键"
+        case .systemAction: "macOS 原生系统动作"
         case .script: "执行本地脚本"
         case .libraryAction: "引用动作库"
         case .voiceInput: "遥控器语音输入（待接入）"
@@ -339,6 +548,7 @@ enum RemoteOutputHoldMode: String, Codable, CaseIterable, Identifiable {
 struct RemoteAction: Codable, Equatable {
     var kind: RemoteBindingKind = .none
     var shortcut: RemoteShortcut?
+    var systemAction: RemoteSystemAction?
     /// An explicitly selected local script file. Do not resolve untrusted remote content here.
     var scriptPath: String?
     var scriptID: UUID?
@@ -364,6 +574,8 @@ struct RemoteAction: Codable, Equatable {
             return effectiveHoldSeconds > 0.15
                 ? "\(shortcut.display) · 按住 \(String(format: "%.2f", effectiveHoldSeconds)) 秒"
                 : shortcut.display
+        case .systemAction:
+            return systemAction.map { "\($0.title) · 系统调用" } ?? "选择系统动作"
         case .script:
             return scriptPath.map { URL(fileURLWithPath: $0).lastPathComponent } ??
                    (scriptID != nil ? "脚本库 · 已关联" : "等待选择脚本")
@@ -377,6 +589,7 @@ struct RemoteBinding: Codable, Equatable {
     /// Tap action fields retained to decode users' saved v1 mappings without migration loss.
     var kind: RemoteBindingKind = .none
     var shortcut: RemoteShortcut?
+    var systemAction: RemoteSystemAction?
     var scriptPath: String?
     var scriptID: UUID?
     var presetID: UUID?
@@ -393,6 +606,7 @@ struct RemoteBinding: Codable, Equatable {
     func action(for gesture: RemoteGesture) -> RemoteAction {
         if gesture == .longPress { return longPressAction ?? RemoteAction() }
         return RemoteAction(kind: kind, shortcut: shortcut,
+                            systemAction: systemAction,
                             scriptPath: scriptPath, scriptID: scriptID,
                             presetID: presetID, outputHoldSeconds: outputHoldSeconds,
                             outputHoldMode: outputHoldMode)
@@ -402,6 +616,7 @@ struct RemoteBinding: Codable, Equatable {
         if gesture == .tap {
             kind = action.kind
             shortcut = action.shortcut
+            systemAction = action.systemAction
             scriptPath = action.scriptPath
             scriptID = action.scriptID
             presetID = action.presetID

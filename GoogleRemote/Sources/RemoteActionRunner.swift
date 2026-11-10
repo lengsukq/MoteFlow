@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import Combine
 import CoreGraphics
 import Foundation
@@ -15,6 +16,7 @@ enum RemoteExecutionError: LocalizedError {
     case missingLibraryAction
     case appNotInstalled(String)
     case appLaunchFailed(String)
+    case systemActionUnavailable(String)
 
     var errorDescription: String? {
         switch self {
@@ -29,7 +31,117 @@ enum RemoteExecutionError: LocalizedError {
         case .missingLibraryAction: "动作库条目已删除、没有步骤，或其内容无效"
         case .appNotInstalled(let name): "未找到应用：\(name)。请在动作库里重新选择已安装的 .app。"
         case .appLaunchFailed(let detail): "启动应用失败：\(detail)"
+        case .systemActionUnavailable(let detail): "系统动作不可用：\(detail)"
         }
+    }
+}
+
+@MainActor
+private enum RemoteSystemActionExecutor {
+    /// Screenshots are handled by macOS itself. No CGEvent shortcuts are
+    /// generated, so the user may remap screenshot shortcuts freely.
+    static func executeSystemAction(_ action: RemoteSystemAction) async throws {
+        for (index, step) in action.executionSequence.enumerated() {
+            try executeSingleAction(step)
+            // Give the frontmost app a chance to apply Select All before Copy
+            // or Paste, especially in web-based text editors.
+            if index + 1 < action.executionSequence.count {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+        }
+    }
+
+    private static func executeSingleAction(_ action: RemoteSystemAction) throws {
+        if let args = action.screenshotArguments {
+            let command = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            guard FileManager.default.isExecutableFile(atPath: command.path) else {
+                throw RemoteExecutionError.systemActionUnavailable("当前 macOS 未提供 screencapture")
+            }
+            let process = Process()
+            process.executableURL = command
+            process.arguments = args
+            process.standardInput = FileHandle.nullDevice
+            try process.run()
+            return
+        }
+        try performFrontmostMenuAction(action)
+    }
+
+    /// There is no public cross-application Copy/Paste command. Query the
+    /// frontmost app's accessible Edit menu *without opening it* and directly
+    /// invoke the matching menu item. Never AXPress the parent menu-bar item:
+    /// doing so visibly drops down the menu on every remote click.
+    /// Unsupported menu trees fail without flashing a menu or guessing keys.
+    private static func performFrontmostMenuAction(_ action: RemoteSystemAction) throws {
+        guard action.usesAccessibilityMenu,
+              let frontmost = NSWorkspace.shared.frontmostApplication,
+              frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
+            throw RemoteExecutionError.systemActionUnavailable(
+                "先切换到需要操作的应用；不能在 MoteFlow 配置窗口中调用其他应用的编辑菜单"
+            )
+        }
+        guard AXIsProcessTrusted() else {
+            throw RemoteExecutionError.systemActionUnavailable(
+                "请在「系统设置 → 隐私与安全性 → 辅助功能」授权 MoteFlow"
+            )
+        }
+        let app = AXUIElementCreateApplication(frontmost.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 2.0)
+        var barValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXMenuBarAttribute as CFString, &barValue) == .success,
+              let barValue else {
+            throw RemoteExecutionError.systemActionUnavailable("当前应用没有可访问的菜单栏")
+        }
+        let menuBar = barValue as! AXUIElement
+        let editTitles = ["Edit", "编辑"]
+        guard let edit = Self.axChildren(menuBar).first(where: {
+            editTitles.contains(Self.axTitle($0))
+        }) else {
+            throw RemoteExecutionError.systemActionUnavailable("当前应用未提供可访问的「编辑」菜单")
+        }
+        // A closed menu's children are generally exposed through AX even when
+        // the menu is not on screen. Opening the "Edit" menu here would cause
+        // an ugly visual flash for every Copy/Paste or composite long-press.
+        let children = Self.axChildren(edit).flatMap { Self.axChildren($0) }
+        let direct = Self.axChildren(edit)
+        let items = children.isEmpty ? direct : children
+        guard let item = items.first(where: { candidate in
+            let title = Self.axTitle(candidate)
+            return action.menuTitles.contains { label in
+                title == label ||
+                ((action == .undo || action == .redo) && title.hasPrefix(label + " "))
+            }
+        }) else {
+            throw RemoteExecutionError.systemActionUnavailable(
+                "无法静默读取当前应用的「\(action.title)」菜单命令；该应用可能不支持在菜单关闭时读取"
+            )
+        }
+        var enabledValue: CFTypeRef?
+        if AXUIElementCopyAttributeValue(item, kAXEnabledAttribute as CFString, &enabledValue) == .success,
+           let enabled = enabledValue as? Bool, !enabled {
+            throw RemoteExecutionError.systemActionUnavailable("当前应用的「\(action.title)」暂不可用")
+        }
+        guard AXUIElementPerformAction(item, kAXPressAction as CFString) == .success else {
+            throw RemoteExecutionError.systemActionUnavailable(
+                "当前应用拒绝执行「\(action.title)」菜单命令"
+            )
+        }
+    }
+
+    private static func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element, kAXChildrenAttribute as CFString, &value
+        ) == .success else { return [] }
+        return value as? [AXUIElement] ?? []
+    }
+
+    private static func axTitle(_ element: AXUIElement) -> String {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element, kAXTitleAttribute as CFString, &value
+        ) == .success else { return "" }
+        return (value as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
 }
@@ -289,6 +401,12 @@ final class RemoteActionRunner: ObservableObject {
             do {
                 if action.kind == .voiceInput {
                     result = "语音动作尚需实体遥控器 ATVV 验证，未执行"
+                } else if action.kind == .systemAction {
+                    guard let native = action.systemAction else {
+                        throw RemoteExecutionError.systemActionUnavailable("未选择系统动作")
+                    }
+                    try await RemoteSystemActionExecutor.executeSystemAction(native)
+                    result = "已请求系统动作：\(native.title)"
                 } else {
                     guard let steps = library.steps(for: action), !steps.isEmpty
                     else { throw RemoteExecutionError.missingLibraryAction }

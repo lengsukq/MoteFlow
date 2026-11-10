@@ -1,6 +1,11 @@
 import AppKit
 import SwiftUI
 
+private enum MappingProfileNameMode {
+    case saveAs
+    case rename
+}
+
 struct RemoteMappingPage: View {
     @ObservedObject var store: RemoteBindingStore
     @ObservedObject var library: RemoteLibraryStore
@@ -8,12 +13,23 @@ struct RemoteMappingPage: View {
     @Binding var selected: RemoteKey
     let onOpenLibrary: () -> Void
     @State private var showingRecorder = false
+    @State private var showingMacPresetPicker = false
+    @State private var presetTarget: RemoteKey = .home
+    @State private var presetGesture: RemoteGesture = .tap
     @State private var editingGesture: RemoteGesture = .tap
     @State private var recordingGesture: RemoteGesture = .tap
     @State private var pendingShortcut: RemoteShortcut?
     @State private var pendingTarget: RemoteKey?
     @State private var pendingGesture: RemoteGesture = .tap
     @State private var showingResetAll = false
+    @State private var pendingProfileSwitchID: UUID?
+    @State private var showingProfileSwitchConfirmation = false
+    @State private var showingProfileNameSheet = false
+    @State private var profileNameMode: MappingProfileNameMode = .saveAs
+    @State private var profileNameInput = ""
+    @State private var profileNameFeedback: String?
+    @State private var showingDeleteNamedProfile = false
+    @State private var showingApplySideKeys = false
     @State private var fileError: String?
     @State private var showUIEventTools = false
     @State private var feedbackKey: RemoteKey?
@@ -33,6 +49,183 @@ struct RemoteMappingPage: View {
         return store.conflictingKey(for: pendingShortcut, excluding: pendingTarget, gesture: pendingGesture)
     }
 
+    private var mappingProfilesPanel: some View {
+        RemoteCard {
+            VStack(alignment: .leading, spacing: 11) {
+                HStack(spacing: 8) {
+                    RemoteSectionTitle(
+                        title: "遥控器映射方案",
+                        subtitle: "出厂映射不可覆盖 · 自定义方案可命名保存",
+                        symbol: "square.stack.3d.up"
+                    )
+                    Spacer(minLength: 5)
+                    Text("\(store.profilesForActiveModel.count) 套已保存")
+                        .font(.system(size: 11, design: .rounded))
+                        .foregroundStyle(.secondary)
+                }
+                HStack(spacing: 10) {
+                    Image(systemName: "slider.horizontal.3")
+                        .foregroundStyle(RemotePalette.indigo)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(store.activeNamedProfile?.name ?? "当前工作映射 · 尚未命名")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(store.activeNamedProfile == nil
+                             ? "正在编辑工作副本；请另存为自己的映射方案"
+                             : store.hasUnsavedNamedChanges
+                               ? "已修改工作副本，尚未更新已保存的方案"
+                               : "与已保存的方案一致")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 6)
+                    Menu {
+                        Button {
+                            pendingProfileSwitchID = nil
+                            showingProfileSwitchConfirmation = true
+                        } label: {
+                            Label("官方默认 · \(store.activeModel.modelLabel)",
+                                  systemImage: "checkmark.shield")
+                        }
+                        if !store.profilesForActiveModel.isEmpty {
+                            Divider()
+                            ForEach(store.profilesForActiveModel) { profile in
+                                Button {
+                                    pendingProfileSwitchID = profile.id
+                                    showingProfileSwitchConfirmation = true
+                                } label: {
+                                    if store.activeProfileID == profile.id {
+                                        Label(profile.name, systemImage: "checkmark")
+                                    } else {
+                                        Text(profile.name)
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("切换方案", systemImage: "chevron.down")
+                    }
+                    .buttonStyle(.bordered)
+                }
+                HStack(spacing: 9) {
+                    Button {
+                        profileNameMode = .saveAs
+                        profileNameInput = ""
+                        profileNameFeedback = nil
+                        showingProfileNameSheet = true
+                    } label: {
+                        Label("另存为新方案", systemImage: "plus.square.on.square")
+                    }
+                    .buttonStyle(RemoteActionButtonStyle(emphasized: true))
+
+                    Button {
+                        _ = store.updateActiveNamedProfile()
+                    } label: {
+                        Label("保存当前修改", systemImage: "square.and.arrow.down")
+                    }
+                    .buttonStyle(RemoteActionButtonStyle())
+                    .disabled(store.activeNamedProfile == nil || !store.hasUnsavedNamedChanges)
+
+                    if store.activeNamedProfile != nil {
+                        Menu {
+                            Button {
+                                profileNameMode = .rename
+                                profileNameInput = store.activeNamedProfile?.name ?? ""
+                                profileNameFeedback = nil
+                                showingProfileNameSheet = true
+                            } label: {
+                                Label("重命名当前方案", systemImage: "pencil")
+                            }
+                            Divider()
+                            Button(role: .destructive) {
+                                showingDeleteNamedProfile = true
+                            } label: {
+                                Label("删除当前命名方案", systemImage: "trash")
+                            }
+                        } label: {
+                            Label("管理方案", systemImage: "ellipsis.circle")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .font(.system(size: 11))
+                if store.activeModel == .googleG9N9N {
+                    HStack(spacing: 9) {
+                        Text("侧键：上短按复制 / 长按全选复制；下短按粘贴 / 长按全选粘贴")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 6)
+                        Button {
+                            showingApplySideKeys = true
+                        } label: {
+                            Label("应用侧键预设", systemImage: "doc.on.clipboard")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                Text("方向键出厂设置：单击移动一步，长按连续移动。应用默认只修改工作副本；修改后请另存为新方案，或明确保存到当前已命名方案。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var profileNameEditor: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            Text(profileNameMode == .saveAs ? "另存为新的遥控器映射方案" : "重命名映射方案")
+                .font(.system(size: 18, weight: .semibold))
+            Text("当前型号：\(store.activeModel.modelLabel)。名称不能和该型号已保存的方案重复。")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            TextField("请输入方案名称（最多 40 个字符）", text: $profileNameInput)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { finishProfileNameEdit() }
+            if let profileNameFeedback {
+                Text(profileNameFeedback)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button("取消") { showingProfileNameSheet = false }
+                    .buttonStyle(.bordered)
+                Button(profileNameMode == .saveAs ? "创建并保存" : "保存名称") {
+                    finishProfileNameEdit()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(22)
+        .frame(width: 430)
+    }
+
+    private func finishProfileNameEdit() {
+        let succeeded: Bool
+        switch profileNameMode {
+        case .saveAs:
+            succeeded = store.saveAsNamedProfile(profileNameInput)
+        case .rename:
+            succeeded = store.activeProfileID.map {
+                store.renameNamedProfile($0, to: profileNameInput)
+            } ?? false
+        }
+        if succeeded {
+            profileNameFeedback = nil
+            showingProfileNameSheet = false
+        } else {
+            profileNameFeedback = store.profileError ?? "无法保存映射方案"
+        }
+    }
+
+    private func bindMacPreset(_ preset: MacShortcutPreset, to key: RemoteKey,
+                               gesture: RemoteGesture) {
+        if let native = preset.nativeAction {
+            store.setSystemAction(native, for: key, gesture: gesture)
+        } else {
+            bindShortcut(preset.shortcut, to: key, gesture: gesture)
+        }
+    }
+
     private var supportsPhysicalHold: Bool {
         guard selected != .assistant, editingGesture == .longPress else { return false }
         if action.kind == .keyboardShortcut { return true }
@@ -50,6 +243,7 @@ struct RemoteMappingPage: View {
 
     private var bindingOptions: [RemoteBindingKind] {
         var options: [RemoteBindingKind] = [.keyboardShortcut, .libraryAction, .none]
+        if selected != .assistant { options.insert(.systemAction, at: 0) }
         if action.kind == .script { options.append(.script) }
         if action.kind == .voiceInput { options.append(.voiceInput) }
         return options
@@ -57,6 +251,7 @@ struct RemoteMappingPage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
+            mappingProfilesPanel
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .top, spacing: 14) {
                     visualPanel.frame(minWidth: 302, maxWidth: 420)
@@ -145,6 +340,9 @@ struct RemoteMappingPage: View {
                 .tint(RemotePalette.indigo)
             }
         }
+        .sheet(isPresented: $showingProfileNameSheet) {
+            profileNameEditor
+        }
         .onChange(of: monitor.activePhysicalKey) { _, key in
             if let key {
                 selected = key
@@ -175,13 +373,20 @@ struct RemoteMappingPage: View {
                 let gesture = recordingGesture
                 // Dismiss the modal first so the conflict alert can become key.
                 DispatchQueue.main.async {
-                    if store.conflictingKey(for: shortcut, excluding: target, gesture: gesture) == nil {
-                        _ = store.setShortcut(shortcut, for: target, gesture: gesture)
-                    } else {
-                        pendingTarget = target
-                        pendingShortcut = shortcut
-                        pendingGesture = gesture
-                    }
+                    bindShortcut(shortcut, to: target, gesture: gesture)
+                }
+            }
+        }
+        .sheet(isPresented: $showingMacPresetPicker) {
+            MacShortcutPickerSheet(
+                selectedAction: store.action(for: presetTarget, gesture: presetGesture)
+            ) { preset in
+                let key = presetTarget
+                let gesture = presetGesture
+                showingMacPresetPicker = false
+                // Present a shortcut conflict alert only after the sheet closes.
+                DispatchQueue.main.async {
+                    bindMacPreset(preset, to: key, gesture: gesture)
                 }
             }
         }
@@ -201,13 +406,54 @@ struct RemoteMappingPage: View {
             Text("这组快捷键已经分配给「\(conflictKey?.title ?? "其他按钮")」的\(pendingGesture.title)动作。是否替换？")
         }
         .confirmationDialog(
-            "恢复所有按键默认设置？",
+            "恢复当前遥控器的出厂映射？",
             isPresented: $showingResetAll
         ) {
-            Button("清除全部映射", role: .destructive) { store.resetAll() }
+            Button("恢复出厂映射", role: .destructive) {
+                store.applyFactoryMapping()
+            }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("所有已保存的按键映射都会被清除，此操作不可撤销。")
+            Text("这会替换当前工作配置，但不会删除已命名保存的方案。建议先「另存为新方案」以保留当前修改；出厂映射本身不会被覆盖。")
+        }
+        .confirmationDialog(
+            "应用 Google 遥控器侧键复制 / 粘贴预设？",
+            isPresented: $showingApplySideKeys
+        ) {
+            Button("仅替换上、下两个侧键") {
+                _ = store.applyGoogleSideKeyClipboardPreset()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("上侧键单击复制、长按全选并复制；下侧键单击粘贴、长按全选并粘贴。长按粘贴会替换当前可编辑区域的全部选中内容，其余键位与已保存的命名方案不会改变。")
+        }
+        .confirmationDialog(
+            "切换映射方案？",
+            isPresented: $showingProfileSwitchConfirmation
+        ) {
+            Button("应用并替换当前工作映射") {
+                if let id = pendingProfileSwitchID {
+                    _ = store.applyNamedProfile(id)
+                } else {
+                    store.applyFactoryMapping()
+                }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("切换将覆盖当前工作映射，但不会改变出厂默认和已保存的命名方案。尚未另存或更新的修改会丢失。")
+        }
+        .confirmationDialog(
+            "删除当前已保存的命名方案？",
+            isPresented: $showingDeleteNamedProfile
+        ) {
+            Button("删除命名方案", role: .destructive) {
+                if let id = store.activeProfileID {
+                    _ = store.deleteNamedProfile(id)
+                }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("只删除命名方案的快照，当前工作映射仍会保留，出厂方案不受影响。")
         }
         .confirmationDialog("确认真实执行此动作？",
                             isPresented: $showExecutionConfirmation) {
@@ -414,6 +660,9 @@ struct RemoteMappingPage: View {
                             compact: true, action: { editingGesture = .longPress }
                         )
                     }
+                    if selected != .assistant {
+                        macShortcutQuickPicker
+                    }
                 }
                 }
 
@@ -487,6 +736,7 @@ struct RemoteMappingPage: View {
 
                     HStack(spacing: 10) {
                         Image(systemName: action.kind == .keyboardShortcut ? "keyboard" :
+                              action.kind == .systemAction ? "gearshape.2" :
                               action.kind == .script ? "terminal" :
                               action.kind == .voiceInput ? "mic" : "minus.circle")
                             .foregroundStyle(RemotePalette.indigo)
@@ -548,6 +798,39 @@ struct RemoteMappingPage: View {
                                 .fixedSize(horizontal: false, vertical: true)
                             }
                         }
+                    }
+                } else if action.kind == .systemAction {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Button {
+                            presetTarget = selected
+                            presetGesture = editingGesture
+                            showingMacPresetPicker = true
+                        } label: {
+                            Label(action.systemAction == nil ? "选择 macOS 系统动作" : "更换系统动作",
+                                  systemImage: "gearshape.2")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(RemoteActionButtonStyle(emphasized: true))
+                        Menu {
+                            ForEach(RemoteSystemAction.allCases) { native in
+                                Button {
+                                    store.setSystemAction(native, for: selected,
+                                                          gesture: editingGesture)
+                                } label: {
+                                    if action.systemAction == native {
+                                        Label(native.title, systemImage: "checkmark")
+                                    } else {
+                                        Text(native.title)
+                                    }
+                                }
+                            }
+                        } label: {
+                            Label("从全部原生系统动作中选择", systemImage: "list.bullet")
+                        }
+                        .buttonStyle(.bordered)
+                        Text("截图直接调用 macOS 截图工具；复制、粘贴等通过当前前台 App 的可访问编辑菜单执行。无需依赖预设快捷键，但需要相应系统权限与应用支持。")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
                     }
                 } else if action.kind == .script {
                     VStack(alignment: .leading, spacing: 11) {
@@ -666,6 +949,7 @@ struct RemoteMappingPage: View {
                         .buttonStyle(RemoteActionButtonStyle(emphasized: true))
                         .disabled(action.kind == .none || action.kind == .voiceInput ||
                                   (action.kind == .keyboardShortcut && action.shortcut == nil) ||
+                                  (action.kind == .systemAction && action.systemAction == nil) ||
                                   (action.kind == .script && action.scriptPath == nil) ||
                                   (action.kind == .libraryAction && library.action(action.presetID) == nil) ||
                                   runner.running)
@@ -690,10 +974,9 @@ struct RemoteMappingPage: View {
                     Button {
                         showingResetAll = true
                     } label: {
-                        Label("恢复全部默认", systemImage: "trash")
+                        Label("恢复出厂映射", systemImage: "arrow.counterclockwise")
                     }
                     .buttonStyle(RemoteActionButtonStyle())
-                    .disabled(store.configuredCount == 0)
                 }
 
                 HStack(alignment: .top, spacing: 8) {
@@ -708,6 +991,77 @@ struct RemoteMappingPage: View {
                 .background(RemotePalette.amber.opacity(0.065),
                             in: RoundedRectangle(cornerRadius: 12))
             }
+        }
+    }
+
+    private var macShortcutQuickPicker: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Label("macOS 系统动作与快捷键", systemImage: "gearshape.2")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer(minLength: 6)
+                Button {
+                    presetTarget = selected
+                    presetGesture = editingGesture
+                    showingMacPresetPicker = true
+                } label: {
+                    Label("查看全部预设", systemImage: "square.grid.2x2")
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 11, weight: .medium))
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 125), spacing: 8)], spacing: 8) {
+                ForEach(MacShortcutPreset.popular) { preset in
+                    let chosen = preset.nativeAction.map {
+                        action.kind == .systemAction && action.systemAction == $0
+                    } ?? (action.kind == .keyboardShortcut && action.shortcut == preset.shortcut)
+                    Button {
+                        bindMacPreset(preset, to: selected, gesture: editingGesture)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: preset.symbol)
+                                .font(.system(size: 13))
+                                .foregroundStyle(RemotePalette.indigo)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(preset.title)
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                Text(preset.nativeAction == nil ? preset.shortcut.display : "系统原生调用")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 0)
+                            if chosen {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(RemotePalette.indigo)
+                            }
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(chosen ? RemotePalette.indigo.opacity(0.09) : Color.primary.opacity(0.035),
+                                    in: RoundedRectangle(cornerRadius: 11))
+                        .overlay(RoundedRectangle(cornerRadius: 11)
+                            .strokeBorder(chosen ? RemotePalette.indigo.opacity(0.48) : .primary.opacity(0.07)))
+                    }
+                    .buttonStyle(.plain)
+                    .help("\(preset.title) · \(preset.nativeAction == nil ? preset.shortcut.display : "不依赖快捷键")")
+                }
+            }
+            Text("点击即绑定到当前\(editingGesture.title)；不会立即执行系统动作。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func bindShortcut(_ shortcut: RemoteShortcut, to key: RemoteKey,
+                              gesture: RemoteGesture) {
+        if store.conflictingKey(for: shortcut, excluding: key, gesture: gesture) == nil {
+            _ = store.setShortcut(shortcut, for: key, gesture: gesture)
+        } else {
+            pendingTarget = key
+            pendingShortcut = shortcut
+            pendingGesture = gesture
         }
     }
 
@@ -808,5 +1162,122 @@ struct RemoteMappingPage: View {
                 fileError = library.error ?? "保存应用启动动作失败"
             }
         }
+    }
+}
+
+/// A searchable shortcut catalog that only selects a mapping. The existing
+/// explicit "试运行真实动作" confirmation remains the execution boundary.
+private struct MacShortcutPickerSheet: View {
+    let selectedAction: RemoteAction
+    let onSelect: (MacShortcutPreset) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var searchText = ""
+
+    private var filtered: [MacShortcutPreset] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return MacShortcutPreset.all }
+        return MacShortcutPreset.all.filter {
+            $0.title.localizedCaseInsensitiveContains(query) ||
+            $0.detail.localizedCaseInsensitiveContains(query) ||
+            $0.shortcut.display.localizedCaseInsensitiveContains(query) ||
+            $0.category.title.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    private func shortcuts(in category: MacShortcutCategory) -> [MacShortcutPreset] {
+        filtered.filter { $0.category == category }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("macOS 系统动作与快捷键")
+                        .font(.system(size: 22, weight: .bold, design: .rounded))
+                    Text("优先使用系统原生调用；其余仍使用可自定义的快捷键")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Button("关闭") { dismiss() }
+                    .buttonStyle(.bordered)
+            }
+            HStack(spacing: 9) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("搜索：截图、复制、粘贴、窗口、⌘…", text: $searchText)
+                    .textFieldStyle(.plain)
+            }
+            .padding(12)
+            .background(.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 11))
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    ForEach(MacShortcutCategory.allCases) { category in
+                        if !shortcuts(in: category).isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Label(category.title, systemImage: category.symbol)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(RemotePalette.indigo)
+                                LazyVGrid(columns: [GridItem(.adaptive(minimum: 210), spacing: 9)], spacing: 9) {
+                                    ForEach(shortcuts(in: category)) { preset in
+                                        let selected = preset.nativeAction.map {
+                                            selectedAction.kind == .systemAction && selectedAction.systemAction == $0
+                                        } ?? (selectedAction.kind == .keyboardShortcut && selectedAction.shortcut == preset.shortcut)
+                                        Button {
+                                            onSelect(preset)
+                                        } label: {
+                                            HStack(alignment: .center, spacing: 10) {
+                                                Image(systemName: preset.symbol)
+                                                    .font(.system(size: 16, weight: .medium))
+                                                    .foregroundStyle(RemotePalette.indigo)
+                                                    .frame(width: 23)
+                                                VStack(alignment: .leading, spacing: 4) {
+                                                    Text(preset.title)
+                                                        .font(.system(size: 12, weight: .semibold))
+                                                        .foregroundStyle(.primary)
+                                                    Text(preset.nativeAction == nil ? preset.shortcut.display : "系统原生调用")
+                                                        .font(.system(size: 11, design: .monospaced))
+                                                        .foregroundStyle(RemotePalette.indigo)
+                                                    Text(preset.detail)
+                                                        .font(.system(size: 10))
+                                                        .foregroundStyle(.secondary)
+                                                        .lineLimit(2)
+                                                }
+                                                Spacer(minLength: 0)
+                                                if selected {
+                                                    Image(systemName: "checkmark.circle.fill")
+                                                        .foregroundStyle(RemotePalette.indigo)
+                                                }
+                                            }
+                                            .padding(12)
+                                            .frame(maxWidth: .infinity, minHeight: 72, alignment: .leading)
+                                            .background(selected ? RemotePalette.indigo.opacity(0.09)
+                                                        : Color.primary.opacity(0.035),
+                                                        in: RoundedRectangle(cornerRadius: 12))
+                                            .overlay(RoundedRectangle(cornerRadius: 12)
+                                                .strokeBorder(selected ? RemotePalette.indigo.opacity(0.45)
+                                                              : .primary.opacity(0.06)))
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if filtered.isEmpty {
+                        ContentUnavailableView.search(text: searchText)
+                            .frame(maxWidth: .infinity, minHeight: 140)
+                    }
+                }
+                .padding(.vertical, 3)
+            }
+            Divider()
+            Text("仅保存映射，不立即执行。截图和部分编辑命令不依赖快捷键；其他条目仍使用预设按键。系统原生菜单操作需要辅助功能权限且由前台 App 提供。")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(22)
+        .frame(minWidth: 540, idealWidth: 660, minHeight: 480, idealHeight: 620)
     }
 }
