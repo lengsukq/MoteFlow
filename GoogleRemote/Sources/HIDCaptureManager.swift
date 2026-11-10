@@ -22,6 +22,7 @@ enum RemoteHIDImportError: LocalizedError {
             "导入文件未标明可识别的遥控器型号，已拒绝。"
         }
     }
+
 }
 
 enum RemoteHIDExportError: LocalizedError {
@@ -97,12 +98,23 @@ final class HIDCaptureManager: ObservableObject {
         didSet { UserDefaults.standard.set(autoSeizeEnabled, forKey: Self.autoKey) }
     }
     @Published var executeHardwareActions: Bool {
-        didSet { UserDefaults.standard.set(executeHardwareActions, forKey: Self.actionsKey) }
+        didSet {
+            UserDefaults.standard.set(executeHardwareActions, forKey: Self.actionsKey)
+            if !executeHardwareActions {
+                onAbortMappedActions?()
+                cancelAllLiveHolds()
+            }
+        }
     }
     @Published var doubaoShortcutTrigger: DoubaoShortcutTrigger {
         didSet { UserDefaults.standard.set(doubaoShortcutTrigger.rawValue, forKey: Self.doubaoTriggerKey) }
     }
     var onMappedGesture: ((RemoteKey, RemoteGesture) -> Void)?
+    var onAbortMappedActions: (() -> Void)?
+    /// Long-press mappings may opt in to a target key held until physical release.
+    var shouldFollowPhysicalHold: ((RemoteKey) -> Bool)?
+    var onMappedHoldStart: ((RemoteKey) -> Bool)?
+    var onMappedHoldEnd: ((RemoteKey) -> Void)?
     /// ATVV mic requests have start/stop semantics, not HID key-up timing.
     var onVoiceSessionStart: (() -> Void)?
     var onVoiceSessionEnd: (() -> Void)?
@@ -116,6 +128,9 @@ final class HIDCaptureManager: ObservableObject {
     private let captureDuration = 90
     private var currentPress: (code: RemoteHIDButtonCode, started: Date)?
     private var xiaomiPresses: [RemoteKey: Date] = [:]
+    private var xiaomiLearningPresses: Set<RemoteKey> = []
+    private var liveHoldTasks: [RemoteKey: Task<Void, Never>] = [:]
+    private var liveHoldsStarted: Set<RemoteKey> = []
     private var flashTask: Task<Void, Never>?
     private var suppressNextRelease = false
     private static let autoKey = "GoogleRemote.autoSeizeOnLaunch.v1"
@@ -394,6 +409,8 @@ final class HIDCaptureManager: ObservableObject {
     }
 
     func stop(reason: String = "用户结束监听，HID 独占已释放") {
+        onAbortMappedActions?()
+        cancelAllLiveHolds()
         timerTask?.cancel()
         timerTask = nil
         var releaseFailure: String?
@@ -409,6 +426,7 @@ final class HIDCaptureManager: ObservableObject {
         currentDeviceIdentity = nil
         currentPress = nil
         xiaomiPresses.removeAll()
+        xiaomiLearningPresses.removeAll()
         activePhysicalKey = nil
         highlightedPhysicalKey = nil
         flashTask?.cancel()
@@ -515,11 +533,17 @@ final class HIDCaptureManager: ObservableObject {
         guard value == 0 || value == 1 else { return }
         if value == 1 {
             guard xiaomiPresses[key] == nil else { return }
+            let isLearning = learningKey == key
             xiaomiPresses[key] = Date()
             hardwareEventSequence += 1
             lastHardwareFeedback = "小米遥控器实体按下「\(key.title)」· HID Usage"
             activePhysicalKey = key
-            if learningKey == key { learningKey = nil }
+            if isLearning {
+                xiaomiLearningPresses.insert(key)
+                learningKey = nil
+            } else if key != .assistant {
+                scheduleLiveHold(for: key)
+            }
             if key == .assistant && !atvvVoiceActive {
                 // Some Xiaomi firmware reports microphone as F5 HID, others
                 // also send an ATVV mic-start. Share a single session gate.
@@ -529,6 +553,8 @@ final class HIDCaptureManager: ObservableObject {
             return
         }
         guard let pressed = xiaomiPresses.removeValue(forKey: key) else { return }
+        let liveHoldWasStarted = endLiveHold(for: key)
+        let wasLearningPress = xiaomiLearningPresses.remove(key) != nil
         activePhysicalKey = nil
         let duration = Date().timeIntervalSince(pressed)
         let gesture = RemotePressClassifier.gesture(
@@ -541,6 +567,8 @@ final class HIDCaptureManager: ObservableObject {
             endATVVVoiceSession()
             return
         }
+        if wasLearningPress { return }
+        if completePhysicalHoldIfNeeded(for: key, gesture: gesture, started: liveHoldWasStarted) { return }
         if learningKey == nil && executeHardwareActions {
             onMappedGesture?(key, gesture)
         }
@@ -581,6 +609,7 @@ final class HIDCaptureManager: ObservableObject {
                 ? learnedCodes.first { $0.value == currentPress.code }?.key : nil
             activePhysicalKey = nil
             guard let pressedKey else { return }
+            let liveHoldWasStarted = endLiveHold(for: pressedKey)
             let threshold = longPressThresholdForKey?(pressedKey) ?? 0.65
             let gesture = RemotePressClassifier.gesture(duration: elapsed, threshold: threshold)
             hardwareEventSequence += 1
@@ -588,6 +617,9 @@ final class HIDCaptureManager: ObservableObject {
             flashPhysicalKey(pressedKey)
             if suppressNextRelease {
                 suppressNextRelease = false
+            } else if completePhysicalHoldIfNeeded(for: pressedKey, gesture: gesture,
+                                                    started: liveHoldWasStarted) {
+                // The live hold has already been controlled by key-down/up.
             } else if learningKey == nil && executeHardwareActions {
                 onMappedGesture?(pressedKey, gesture)
             }
@@ -595,6 +627,11 @@ final class HIDCaptureManager: ObservableObject {
         }
         // Ignore held-key auto repeats; send at most one action when released.
         if currentPress?.code == signal { return }
+        if let oldPress = currentPress,
+           let oldKey = learnedCodes.first(where: { $0.value == oldPress.code })?.key {
+            // Lost release or a different HID code replaced the held key.
+            endLiveHold(for: oldKey)
+        }
         currentPress = (signal, Date())
         hardwareEventSequence += 1
 
@@ -622,10 +659,56 @@ final class HIDCaptureManager: ObservableObject {
             highlightedPhysicalKey = key
             flashTask?.cancel()
             lastHardwareFeedback = "实体按下「\(key.title)」· 原始码 \(signal.code)"
+            scheduleLiveHold(for: key)
         } else {
             activePhysicalKey = nil
             lastHardwareFeedback = "收到未学习硬件码 \(signal.code)（Report \(signal.reportID)）"
         }
+    }
+
+    private func scheduleLiveHold(for key: RemoteKey) {
+        guard executeHardwareActions, learningKey == nil,
+              shouldFollowPhysicalHold?(key) == true,
+              liveHoldTasks[key] == nil else { return }
+        let delay = longPressThresholdForKey?(key) ?? 0.65
+        liveHoldTasks[key] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(min(5, max(0.2, delay))))
+            guard !Task.isCancelled, let self, self.isCapturing,
+                  self.executeHardwareActions, self.learningKey == nil,
+                  self.shouldFollowPhysicalHold?(key) == true else { return }
+            let stillPressed = self.xiaomiPresses[key] != nil ||
+                (self.currentPress?.code == self.learnedCodes[key])
+            guard stillPressed else { return }
+            if self.onMappedHoldStart?(key) == true { self.liveHoldsStarted.insert(key) }
+        }
+    }
+
+    @discardableResult
+    private func endLiveHold(for key: RemoteKey) -> Bool {
+        liveHoldTasks.removeValue(forKey: key)?.cancel()
+        let started = liveHoldsStarted.remove(key) != nil
+        if started { onMappedHoldEnd?(key) }
+        return started
+    }
+
+    private func completePhysicalHoldIfNeeded(for key: RemoteKey, gesture: RemoteGesture,
+                                               started: Bool) -> Bool {
+        guard gesture == .longPress, shouldFollowPhysicalHold?(key) == true else { return false }
+        // A very short scheduling delay on a busy main loop can put key-up
+        // just ahead of the threshold task. Still send one valid down/up pair.
+        if !started && executeHardwareActions && learningKey == nil,
+           onMappedHoldStart?(key) == true {
+            onMappedHoldEnd?(key)
+        }
+        return true
+    }
+
+    private func cancelAllLiveHolds() {
+        for task in liveHoldTasks.values { task.cancel() }
+        liveHoldTasks.removeAll()
+        let keys = liveHoldsStarted
+        liveHoldsStarted.removeAll()
+        for key in keys { onMappedHoldEnd?(key) }
     }
 
     private func flashPhysicalKey(_ key: RemoteKey) {

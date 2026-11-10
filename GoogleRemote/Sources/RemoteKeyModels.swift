@@ -307,6 +307,14 @@ enum RemoteGesture: String, CaseIterable, Codable, Identifiable {
     var title: String { self == .tap ? "单击" : "长按" }
 }
 
+enum RemoteOutputHoldMode: String, Codable, CaseIterable, Identifiable {
+    case timed
+    case physical
+
+    var id: String { rawValue }
+    var title: String { self == .timed ? "固定时长" : "跟随实体按住" }
+}
+
 struct RemoteAction: Codable, Equatable {
     var kind: RemoteBindingKind = .none
     var shortcut: RemoteShortcut?
@@ -317,6 +325,10 @@ struct RemoteAction: Codable, Equatable {
     /// How long to hold the target keyboard key down (seconds).
     /// Nil preserves legacy profiles' short keystroke behavior.
     var outputHoldSeconds: Double?
+    /// Nil keeps existing saved actions in fixed-duration mode.
+    var outputHoldMode: RemoteOutputHoldMode?
+
+    var effectiveHoldMode: RemoteOutputHoldMode { outputHoldMode ?? .timed }
 
     var effectiveHoldSeconds: Double {
         min(10, max(0.04, outputHoldSeconds ?? 0.08))
@@ -327,6 +339,7 @@ struct RemoteAction: Codable, Equatable {
         case .none: return "未配置"
         case .keyboardShortcut:
             guard let shortcut else { return "等待录制" }
+            if effectiveHoldMode == .physical { return "\(shortcut.display) · 跟随实体按住" }
             return effectiveHoldSeconds > 0.15
                 ? "\(shortcut.display) · 按住 \(String(format: "%.2f", effectiveHoldSeconds)) 秒"
                 : shortcut.display
@@ -347,6 +360,7 @@ struct RemoteBinding: Codable, Equatable {
     var scriptID: UUID?
     var presetID: UUID?
     var outputHoldSeconds: Double?
+    var outputHoldMode: RemoteOutputHoldMode?
     var longPressAction: RemoteAction?
     /// Duration the *physical* remote key must remain depressed to count as a long press.
     var longPressThreshold: Double?
@@ -359,7 +373,8 @@ struct RemoteBinding: Codable, Equatable {
         if gesture == .longPress { return longPressAction ?? RemoteAction() }
         return RemoteAction(kind: kind, shortcut: shortcut,
                             scriptPath: scriptPath, scriptID: scriptID,
-                            presetID: presetID, outputHoldSeconds: outputHoldSeconds)
+                            presetID: presetID, outputHoldSeconds: outputHoldSeconds,
+                            outputHoldMode: outputHoldMode)
     }
 
     mutating func setAction(_ action: RemoteAction, for gesture: RemoteGesture) {
@@ -370,6 +385,7 @@ struct RemoteBinding: Codable, Equatable {
             scriptID = action.scriptID
             presetID = action.presetID
             outputHoldSeconds = action.outputHoldSeconds
+            outputHoldMode = action.outputHoldMode
         } else {
             longPressAction = action
         }

@@ -40,6 +40,8 @@ final class RemoteAppRuntime: ObservableObject {
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
                     self?.runner?.endVoiceShortcutHold()
+                    self?.runner?.cancelPendingMappedActions()
+                    self?.runner?.endMappedShortcutHold()
                     // Close the microphone lease before quitting, even if
                     // all SwiftUI windows have been hidden for hours.
                     self?.bluetooth?.stopVoiceMode()

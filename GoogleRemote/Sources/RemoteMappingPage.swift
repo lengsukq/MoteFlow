@@ -33,6 +33,15 @@ struct RemoteMappingPage: View {
         return store.conflictingKey(for: pendingShortcut, excluding: pendingTarget, gesture: pendingGesture)
     }
 
+    private var supportsPhysicalHold: Bool {
+        guard selected != .assistant, editingGesture == .longPress else { return false }
+        if action.kind == .keyboardShortcut { return true }
+        if action.kind == .libraryAction,
+           let steps = library.steps(for: action), steps.count == 1,
+           steps[0].kind == .keyboard, steps[0].shortcut != nil { return true }
+        return false
+    }
+
     private var currentActionIsApp: Bool {
         guard action.kind == .libraryAction,
               let steps = library.action(action.presetID)?.steps else { return false }
@@ -521,6 +530,7 @@ struct RemoteMappingPage: View {
                             .foregroundStyle(RemotePalette.indigo)
                             .fixedSize(horizontal: false, vertical: true)
                         } else {
+                            if editingGesture != .longPress || action.effectiveHoldMode == .timed {
                             HStack {
                                 Text("目标键按住时长").font(.system(size: 12, weight: .semibold))
                                 Spacer()
@@ -536,6 +546,7 @@ struct RemoteMappingPage: View {
                                 .font(.system(size: 11))
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
                     }
                 } else if action.kind == .script {
@@ -600,6 +611,28 @@ struct RemoteMappingPage: View {
                     Text("语音动作已作为单击或长按预设保存；实体语音键触发仍需 ATVV 真机验收。")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
+                }
+
+                if supportsPhysicalHold {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("长按输出方式")
+                            .font(.system(size: 12, weight: .semibold))
+                        Picker("长按输出方式", selection: Binding(
+                            get: { action.effectiveHoldMode },
+                            set: { store.setOutputHoldMode($0, for: selected, gesture: .longPress) }
+                        )) {
+                            ForEach(RemoteOutputHoldMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        Text(action.effectiveHoldMode == .physical
+                             ? "实体遥控器按住超过上方判定阈值时，Mac 开始按住目标键；实体键松开就立即释放，不再按固定秒数。仅限单个键盘快捷键（含单步骤动作库）。"
+                             : "使用已设置的目标键固定按住时长；实体遥控器释放后执行。")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 10) {

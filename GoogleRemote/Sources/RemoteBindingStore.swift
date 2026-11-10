@@ -43,6 +43,15 @@ final class RemoteBindingStore: ObservableObject {
         save()
     }
 
+    func setOutputHoldMode(_ mode: RemoteOutputHoldMode, for key: RemoteKey, gesture: RemoteGesture) {
+        var binding = binding(for: key)
+        var action = binding.action(for: gesture)
+        action.outputHoldMode = mode
+        binding.setAction(action, for: gesture)
+        bindings[key] = binding
+        save()
+    }
+
     /// Safe first-run suggestions, not unverified HID report codes.
     /// A new device still needs a real hardware match or learning session.
     static func factoryActionBindings(for model: RemoteDeviceModel) -> [RemoteKey: RemoteBinding] {

@@ -335,6 +335,35 @@ struct ContentView: View {
             hidCapture.longPressThresholdForKey = { [weak mappingStore] key in
                 mappingStore?.binding(for: key).effectiveThreshold ?? 0.65
             }
+            let physicalShortcut: (RemoteKey) -> RemoteShortcut? = { [weak mappingStore, weak actionLibrary, weak hidCapture] key in
+                guard let mappingStore, let actionLibrary,
+                      let device = hidCapture?.currentDeviceIdentity,
+                      let model = RemoteDeviceProfileRegistry.identify(
+                        vendorID: device.vendorID, productID: device.productID,
+                        productName: device.productName
+                      ), model == mappingStore.activeModel,
+                      model.keys.contains(key) else { return nil }
+                let action = mappingStore.action(for: key, gesture: .longPress)
+                guard action.effectiveHoldMode == .physical else { return nil }
+                if action.kind == .keyboardShortcut { return action.shortcut }
+                if action.kind == .libraryAction,
+                   let steps = actionLibrary.steps(for: action),
+                   steps.count == 1, steps[0].kind == .keyboard {
+                    return steps[0].shortcut
+                }
+                return nil
+            }
+            hidCapture.shouldFollowPhysicalHold = { key in physicalShortcut(key) != nil }
+            hidCapture.onMappedHoldStart = { [weak actionRunner] key in
+                guard let shortcut = physicalShortcut(key) else { return false }
+                return actionRunner?.beginMappedShortcutHold(shortcut, for: key) ?? false
+            }
+            hidCapture.onMappedHoldEnd = { [weak actionRunner] key in
+                actionRunner?.endMappedShortcutHold(for: key)
+            }
+            hidCapture.onAbortMappedActions = { [weak actionRunner] in
+                actionRunner?.cancelPendingMappedActions()
+            }
             hidCapture.onMappedGesture = { [weak mappingStore, weak actionLibrary, weak actionRunner, weak hidCapture] key, gesture in
                 guard let mappingStore, let actionLibrary, let actionRunner,
                       let device = hidCapture?.currentDeviceIdentity,
@@ -345,7 +374,7 @@ struct ContentView: View {
                       model.keys.contains(key) else { return }
                 let action = mappingStore.action(for: key, gesture: gesture)
                 guard action.kind != .none && action.kind != .voiceInput else { return }
-                actionRunner.test(action: action, label: "实体\(key.title) · \(gesture.title)", library: actionLibrary)
+                actionRunner.enqueueMappedAction(action, label: "实体\(key.title) · \(gesture.title)", library: actionLibrary)
             }
             hidCapture.tryAutomaticCapture()
         }
@@ -353,7 +382,17 @@ struct ContentView: View {
             hidCapture.tryAutomaticCapture()
         }
         .onChange(of: hidCapture.executeHardwareActions) { _, enabled in
-            if !enabled { actionRunner.endVoiceShortcutHold() }
+            if !enabled {
+                actionRunner.cancelPendingMappedActions()
+                actionRunner.endVoiceShortcutHold()
+                actionRunner.endMappedShortcutHold()
+            }
+        }
+        .onChange(of: hidCapture.isCapturing) { _, capturing in
+            if !capturing {
+                actionRunner.cancelPendingMappedActions()
+                actionRunner.endMappedShortcutHold()
+            }
         }
         .onChange(of: hidCapture.currentDeviceIdentity) { _, device in
             guard let device,

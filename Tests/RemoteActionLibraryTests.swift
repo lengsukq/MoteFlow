@@ -18,17 +18,32 @@ final class RemoteActionLibraryTests: XCTestCase {
         XCTAssertTrue(store.setShortcut(exampleKey, for: .home, gesture: .longPress))
         store.setOutputHold(2.0, for: .home, gesture: .tap)
         store.setLongPressThreshold(1.2, for: .home)
+        store.setOutputHoldMode(.physical, for: .home, gesture: .longPress)
 
         let reloaded = RemoteBindingStore(defaults: defaults)
         XCTAssertEqual(reloaded.action(for: .home, gesture: .tap).effectiveHoldSeconds, 2.0)
         XCTAssertEqual(reloaded.action(for: .home, gesture: .longPress).effectiveHoldSeconds, 0.08)
+        XCTAssertEqual(reloaded.action(for: .home, gesture: .tap).effectiveHoldMode, .timed)
+        XCTAssertEqual(reloaded.action(for: .home, gesture: .longPress).effectiveHoldMode, .physical)
         XCTAssertEqual(reloaded.binding(for: .home).effectiveThreshold, 1.2)
         XCTAssertEqual(RemotePressClassifier.gesture(duration: 0.9, threshold: 1.2), .tap)
+        XCTAssertEqual(RemotePressClassifier.gesture(duration: 0.01, threshold: 1.2), .tap)
         XCTAssertEqual(RemotePressClassifier.gesture(duration: 1.2, threshold: 1.2), .longPress)
         reloaded.reset(.home, gesture: .tap)
         XCTAssertEqual(reloaded.action(for: .home, gesture: .tap).kind, .none)
         XCTAssertEqual(reloaded.action(for: .home, gesture: .longPress).kind, .keyboardShortcut)
         XCTAssertEqual(reloaded.configuredCount, 1)
+    }
+
+    func testLegacyActionsDefaultToTimedHoldAndModePersistsForLongPress() throws {
+        let legacy = try JSONDecoder().decode(RemoteAction.self, from: Data("{\"kind\":\"keyboardShortcut\",\"outputHoldSeconds\":2}".utf8))
+        XCTAssertEqual(legacy.effectiveHoldMode, .timed)
+        let suite = "GoogleRemote.test-output-hold.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { XCTFail(); return }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = RemoteBindingStore(defaults: defaults)
+        store.setOutputHoldMode(.physical, for: .home, gesture: .longPress)
+        XCTAssertEqual(RemoteBindingStore(defaults: defaults).action(for: .home, gesture: .longPress).effectiveHoldMode, .physical)
     }
 
     func testUnifiedActionLibraryPersistsAndReferencesLiveSteps() {

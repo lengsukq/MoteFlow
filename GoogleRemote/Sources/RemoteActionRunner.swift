@@ -43,6 +43,9 @@ final class RemoteActionRunner: ObservableObject {
     @Published private(set) var voiceShortcutHeld = false
     private var voiceKeyUp: CGEvent?
     private var heldVoiceShortcut: RemoteShortcut?
+    private var mappedHold: (key: RemoteKey, shortcut: RemoteShortcut, keyUp: CGEvent)?
+    private var mappedHoldWatchdog: Task<Void, Never>?
+    private var pendingMappedActions: [(action: RemoteAction, label: String, library: RemoteLibraryStore)] = []
 
     private static func flags(for shortcut: RemoteShortcut) -> CGEventFlags {
         var flags: CGEventFlags = []
@@ -130,7 +133,7 @@ final class RemoteActionRunner: ObservableObject {
     /// Doubao's configurable hold-to-dictate hotkey. This controls Doubao
     /// reading its OWN selected macOS microphone; it does not route ATVV PCM.
     func beginVoiceShortcutHold(_ shortcut: RemoteShortcut) {
-        guard !voiceShortcutHeld && !running else { return }
+        guard !voiceShortcutHeld && !running && mappedHold == nil else { return }
         guard CGPreflightPostEventAccess() else {
             result = "无法按住豆包快捷键：请先授予辅助功能权限。"
             return
@@ -162,9 +165,78 @@ final class RemoteActionRunner: ObservableObject {
         result = "豆包快捷键已释放；等待豆包完成听写并输入到当前文本框"
     }
 
+    /// This is an actual key-down/key-up pair, not a timer-based key press.
+    /// HID key-up (or capture shutdown) is responsible for releasing it.
+    @discardableResult
+    func beginMappedShortcutHold(_ shortcut: RemoteShortcut, for key: RemoteKey) -> Bool {
+        guard mappedHold == nil, !running, !voiceShortcutHeld else {
+            result = "已有按键动作执行中，无法开始新的实体长按"
+            return false
+        }
+        guard CGPreflightPostEventAccess() else {
+            _ = CGRequestPostEventAccess()
+            result = "实时长按需要 macOS「辅助功能」权限"
+            return false
+        }
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: shortcut.keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: shortcut.keyCode, keyDown: false)
+        else {
+            result = "无法生成实时长按的键盘事件"
+            return false
+        }
+        Self.configureMainKeyEvents(down, up, shortcut: shortcut)
+        mappedHold = (key, shortcut, up)
+        Self.postPhysicalModifiers(shortcut, pressing: true)
+        down.post(tap: .cghidEventTap)
+        result = "实体「\(key.title)」正在按住 \(shortcut.display)，松开遥控器即释放"
+        // Failsafe only: if the remote never reports key-up, do not leave a
+        // key logically down forever. Ordinary releases have no fixed duration.
+        mappedHoldWatchdog?.cancel()
+        mappedHoldWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(120))
+            guard !Task.isCancelled else { return }
+            self?.endMappedShortcutHold(for: key)
+        }
+        return true
+    }
+
+    func endMappedShortcutHold(for key: RemoteKey? = nil) {
+        guard let held = mappedHold, key == nil || held.key == key else { return }
+        mappedHoldWatchdog?.cancel()
+        mappedHoldWatchdog = nil
+        mappedHold = nil
+        held.keyUp.post(tap: .cghidEventTap)
+        Self.postPhysicalModifiers(held.shortcut, pressing: false)
+        result = "已随实体「\(held.key.title)」松开而释放 \(held.shortcut.display)"
+        drainMappedActions()
+    }
+
+    /// HID releases can arrive much faster than the macOS key-up timer.
+    /// Never discard a short tap because a previous mapped action is running.
+    func enqueueMappedAction(_ action: RemoteAction, label: String, library: RemoteLibraryStore) {
+        // A bounded queue avoids runaway execution if a remote repeats unexpectedly.
+        guard pendingMappedActions.count < 24 else {
+            result = "连续按键过多，已限制待执行动作队列"
+            return
+        }
+        pendingMappedActions.append((action, label, library))
+        drainMappedActions()
+    }
+
+    func cancelPendingMappedActions() {
+        pendingMappedActions.removeAll()
+    }
+
+    private func drainMappedActions() {
+        guard !running && !voiceShortcutHeld && mappedHold == nil,
+              !pendingMappedActions.isEmpty else { return }
+        let next = pendingMappedActions.removeFirst()
+        test(action: next.action, label: next.label, library: next.library)
+    }
+
     /// One short key down/up pair. No held state remains after the tap.
     func tapVoiceShortcut(_ shortcut: RemoteShortcut) {
-        guard !running && !voiceShortcutHeld else { return }
+        guard !running && !voiceShortcutHeld && mappedHold == nil else { return }
         Task {
             do {
                 try await emitKeyboard(shortcut, holdSeconds: 0.08)
@@ -176,7 +248,7 @@ final class RemoteActionRunner: ObservableObject {
     }
 
     func test(action: RemoteAction, label: String, library: RemoteLibraryStore) {
-        guard !running && !voiceShortcutHeld else { return }
+        guard !running && !voiceShortcutHeld && mappedHold == nil else { return }
         running = true
         result = "正在执行：\(label)"
 
@@ -207,6 +279,7 @@ final class RemoteActionRunner: ObservableObject {
                 result = "试运行失败：\(error.localizedDescription)"
             }
             running = false
+            drainMappedActions()
         }
     }
 
