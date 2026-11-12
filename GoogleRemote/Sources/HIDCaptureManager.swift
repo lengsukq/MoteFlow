@@ -397,15 +397,19 @@ final class HIDCaptureManager: ObservableObject {
         UserDefaults.standard.set(candidate.id, forKey: Self.lastInterfaceKey)
 
         timerTask?.cancel()
-        if !persistent { timerTask = Task { [weak self] in
-            for _ in 0..<captureDuration {
-                try? await Task.sleep(for: .seconds(1))
-                guard !Task.isCancelled, let self, self.isCapturing else { return }
-                self.remainingSeconds -= 1
+        let duration = captureDuration
+        if !persistent {
+            timerTask = Task { [weak self] in
+                for _ in 0..<duration {
+                    try? await Task.sleep(for: .seconds(1))
+                    guard !Task.isCancelled, let self, self.isCapturing else { return }
+                    self.remainingSeconds -= 1
+                }
+                self?.stop(reason: "90 秒时间到，已自动释放 HID 独占")
             }
-            self?.stop(reason: "90 秒时间到，已自动释放 HID 独占")
-        }}
-        else { remainingSeconds = 0 }
+        } else {
+            remainingSeconds = 0
+        }
     }
 
     func stop(reason: String = "用户结束监听，HID 独占已释放") {

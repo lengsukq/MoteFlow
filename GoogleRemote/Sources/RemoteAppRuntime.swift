@@ -3,7 +3,8 @@ import Combine
 import SwiftUI
 
 /// Owns the small always-on part of the app independently of the main
-/// SwiftUI window. Hiding/closing the window must never stop HID monitoring.
+/// SwiftUI window. Hiding/closing the window must never stop HID monitoring
+/// or Dual-Mac LAN relay forwarding.
 @MainActor
 final class RemoteAppRuntime: ObservableObject {
     @Published var lightweightModeEnabled: Bool {
@@ -19,6 +20,7 @@ final class RemoteAppRuntime: ObservableObject {
     private weak var monitor: HIDCaptureManager?
     private weak var runner: RemoteActionRunner?
     private weak var bluetooth: RemoteBluetoothManager?
+    private weak var lanRelay: RemoteLANRelayManager?
     private var monitoringTask: Task<Void, Never>?
     private var terminationObserver: NSObjectProtocol?
     private var handledInitialWindow = false
@@ -27,12 +29,16 @@ final class RemoteAppRuntime: ObservableObject {
         lightweightModeEnabled = UserDefaults.standard.bool(forKey: Self.preferenceKey)
     }
 
-    func startKeepingRemoteAlive(_ manager: HIDCaptureManager,
-                                 runner: RemoteActionRunner,
-                                 bluetooth: RemoteBluetoothManager) {
+    func startKeepingRemoteAlive(
+        _ manager: HIDCaptureManager,
+        runner: RemoteActionRunner,
+        bluetooth: RemoteBluetoothManager,
+        lanRelay: RemoteLANRelayManager? = nil
+    ) {
         monitor = manager
         self.runner = runner
         self.bluetooth = bluetooth
+        self.lanRelay = lanRelay
         if terminationObserver == nil {
             terminationObserver = NotificationCenter.default.addObserver(
                 forName: NSApplication.willTerminateNotification,
@@ -42,6 +48,8 @@ final class RemoteAppRuntime: ObservableObject {
                     self?.runner?.endVoiceShortcutHold()
                     self?.runner?.cancelPendingMappedActions()
                     self?.runner?.endMappedShortcutHold()
+                    self?.lanRelay?.hotkeyMonitor.unregister()
+                    self?.lanRelay?.disconnectCurrentPeer(reason: "MoteFlow 退出", pauseSessionAutoConnect: false)
                     // Close the microphone lease before quitting, even if
                     // all SwiftUI windows have been hidden for hours.
                     self?.bluetooth?.stopVoiceMode()
@@ -66,41 +74,44 @@ final class RemoteAppRuntime: ObservableObject {
                 // Restore the user's previous menu-bar-only choice on launch.
                 Task { @MainActor in
                     try? await Task.sleep(for: .milliseconds(130))
-                    enterLightweightMode()
+                    enterLightweightMode(announceHUD: false)
                 }
                 return
             }
         }
         mainWindowVisible = true
-        // Allow a normal macOS app window and Dock behavior while editing.
         NSApp.setActivationPolicy(.regular)
     }
 
     func mainWindowDidDisappear() {
         mainWindowVisible = false
         if lightweightModeEnabled {
-            // Accessory apps retain their status-bar menu without a Dock icon.
             NSApp.setActivationPolicy(.accessory)
         }
     }
 
-    func enterLightweightMode() {
+    func enterLightweightMode(announceHUD: Bool = true) {
         lightweightModeEnabled = true
         for window in NSApp.windows where window.canBecomeMain && window.isVisible {
             window.orderOut(nil)
         }
         mainWindowVisible = false
         NSApp.setActivationPolicy(.accessory)
+        if announceHUD {
+            RemoteSwitchHUDController.shared.show(
+                title: "已进入菜单栏轻量模式",
+                subtitle: "遥控器与双机互联仍在后台运行 · 点击右上角菜单栏图标可重新打开",
+                symbol: "menubar.arrow.up.rectangle",
+                tint: RemotePalette.indigo
+            )
+        }
     }
 
     func openMainWindow(_ open: () -> Void) {
-        // Opening the configuration UI is intentional, even if the persistent
-        // preference still says to return to the menu bar when closed.
         handledInitialWindow = true
         NSApp.setActivationPolicy(.regular)
         open()
-        NSApp.activate(ignoringOtherApps: true)
-        // WindowGroup may recreate a closed window on the next run-loop turn.
+        NSApp.activate()
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(120))
             NSApp.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)

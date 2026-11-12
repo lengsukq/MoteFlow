@@ -9,6 +9,7 @@ struct GoogleRemoteApp: App {
     @StateObject private var actionLibrary = RemoteLibraryStore()
     @StateObject private var actionRunner = RemoteActionRunner()
     @StateObject private var runtime = RemoteAppRuntime()
+    @StateObject private var lanRelay = RemoteLANRelayManager()
 
     var body: some Scene {
         WindowGroup("MoteFlow", id: "main") {
@@ -19,16 +20,20 @@ struct GoogleRemoteApp: App {
                 .environmentObject(actionLibrary)
                 .environmentObject(actionRunner)
                 .environmentObject(runtime)
-                .frame(minWidth: 860, minHeight: 580)
+                .environmentObject(lanRelay)
+                .frame(minWidth: 880, minHeight: 600)
                 .onAppear { runtime.mainWindowDidAppear() }
                 .onDisappear { runtime.mainWindowDidDisappear() }
         }
-        .defaultSize(width: 1170, height: 780)
+        .defaultSize(width: 1180, height: 800)
 
         MenuBarExtra("MoteFlow", image: "MoteFlowStatusIcon") {
             RemoteMenuBarContent(
-                runtime: runtime, bluetooth: bluetooth, hidCapture: hidCapture,
-                actionRunner: actionRunner
+                runtime: runtime,
+                bluetooth: bluetooth,
+                hidCapture: hidCapture,
+                actionRunner: actionRunner,
+                lanRelay: lanRelay
             )
         }
     }
@@ -40,28 +45,72 @@ private struct RemoteMenuBarContent: View {
     @ObservedObject var bluetooth: RemoteBluetoothManager
     @ObservedObject var hidCapture: HIDCaptureManager
     @ObservedObject var actionRunner: RemoteActionRunner
+    @ObservedObject var lanRelay: RemoteLANRelayManager
 
     var body: some View {
-        Label(runtime.lightweightModeEnabled ? "轻量模式 · 菜单栏运行" : "MoteFlow 正在运行",
-              systemImage: "checkmark.circle.fill")
-        Label(hidCapture.isExclusive ? "HID 按键已接管" : "HID 尚未就绪",
-              systemImage: hidCapture.isExclusive ? "checkmark.shield.fill" : "keyboard")
-        Label(bluetooth.connectedDeviceID != nil ? "语音 BLE 已连接" : "语音 BLE 未连接",
-              systemImage: "waveform")
-        Text(bluetooth.isRecording ? "ATVV 正在采集语音" :
-                bluetooth.audioChannelActive ? "ATVV 正在打开音频通道" :
-                bluetooth.voiceModeEnabled ? "ATVV 按键待机 · 麦克风未占用" : "ATVV 监听已关闭")
+        Label(
+            runtime.lightweightModeEnabled ? "轻量模式 · 菜单栏运行中" : "MoteFlow 正在运行",
+            systemImage: "checkmark.circle.fill"
+        )
+        Label(
+            hidCapture.isExclusive ? "遥控器按键：已独占就绪" : "遥控器按键：等待连接",
+            systemImage: hidCapture.isExclusive ? "checkmark.shield.fill" : "keyboard"
+        )
+        Label(
+            lanRelay.isForwardingToRemoteMac
+                ? "当前控制：远端「\(lanRelay.connectedPeerName ?? "另一台 Mac")」"
+                : lanRelay.isControlledByPeer
+                    ? "正在接收来自「\(lanRelay.controllingPeerName ?? "主控 Mac")」的操作"
+                    : "当前控制：本机 Mac",
+            systemImage: lanRelay.isForwardingToRemoteMac ? "macbook.and.ipad" : "desktopcomputer"
+        )
+        Label(
+            bluetooth.isRecording ? "语音：正在采集录音" :
+                bluetooth.voiceModeEnabled ? "语音：待机就绪" : "语音：未开启监听",
+            systemImage: "waveform"
+        )
         Divider()
-        Button("打开控制台") { runtime.openMainWindow { openWindow(id: "main") } }
-            .keyboardShortcut("o")
+        Button("打开主界面") {
+            runtime.openMainWindow { openWindow(id: "main") }
+        }
+        .keyboardShortcut("o")
+
+        if lanRelay.isConnected {
+            Button(
+                lanRelay.activeTarget == .remoteMac
+                    ? "切回控制本机 Mac (\(lanRelay.switchShortcut.display))"
+                    : "切换控制「\(lanRelay.connectedPeerName ?? "另一台 Mac")」(\(lanRelay.switchShortcut.display))"
+            ) {
+                lanRelay.toggleTarget(showHUD: true)
+            }
+
+            Menu("远程按键跟随方式") {
+                Button {
+                    lanRelay.setMappingFollowSource(.followRemoteMac)
+                } label: {
+                    if lanRelay.localMappingFollowSource == .followRemoteMac {
+                        Label("跟随远程的遥控器设置", systemImage: "checkmark")
+                    } else {
+                        Text("跟随远程的遥控器设置")
+                    }
+                }
+                Button {
+                    lanRelay.setMappingFollowSource(.followLocalMac)
+                } label: {
+                    if lanRelay.localMappingFollowSource == .followLocalMac {
+                        Label("跟随本机的遥控器设置", systemImage: "checkmark")
+                    } else {
+                        Text("跟随本机的遥控器设置")
+                    }
+                }
+            }
+        }
+
         if runtime.mainWindowVisible {
-            Button("收起到菜单栏") { runtime.enterLightweightMode() }
+            Button("进入轻量模式（收起到菜单栏）") { runtime.enterLightweightMode() }
         }
-        Button(hidCapture.autoSeizeEnabled ? "暂停按键拦截" : "恢复按键拦截") {
-            if hidCapture.autoSeizeEnabled { hidCapture.disableAutomaticCapture() }
-            else { hidCapture.enableAutomaticCapture() }
-        }
-        Button(hidCapture.executeHardwareActions ? "暂停动作执行" : "允许动作执行") {
+        Divider()
+        Button(hidCapture.executeHardwareActions ? "暂停遥控器动作执行" : "开启遥控器动作执行") {
             if hidCapture.executeHardwareActions {
                 actionRunner.endVoiceShortcutHold()
                 bluetooth.stopCurrentVoiceSession()
@@ -69,19 +118,25 @@ private struct RemoteMenuBarContent: View {
             }
             hidCapture.executeHardwareActions.toggle()
         }
-        Divider()
-        Button(bluetooth.voiceModeEnabled ? "关闭语音键监听" : "启用语音键监听") {
+        Button(hidCapture.autoSeizeEnabled ? "暂停遥控器按键接管" : "恢复遥控器按键接管") {
+            if hidCapture.autoSeizeEnabled { hidCapture.disableAutomaticCapture() }
+            else { hidCapture.enableAutomaticCapture() }
+        }
+        Button(bluetooth.voiceModeEnabled ? "关闭语音键监听" : "开启语音键监听") {
             bluetooth.toggleVoiceMode()
         }
         .disabled(!bluetooth.canEnableVoiceMode)
-        Button("退出轻量模式并打开主窗口") {
-            runtime.lightweightModeEnabled = false
-            runtime.openMainWindow { openWindow(id: "main") }
+
+        if runtime.lightweightModeEnabled {
+            Button("恢复常规 Dock 窗口模式") {
+                runtime.lightweightModeEnabled = false
+                runtime.openMainWindow { openWindow(id: "main") }
+            }
         }
-        .disabled(!runtime.lightweightModeEnabled)
         Divider()
         Button("彻底退出 MoteFlow") {
             actionRunner.endVoiceShortcutHold()
+            lanRelay.disconnectCurrentPeer(reason: "退出应用", pauseSessionAutoConnect: false)
             bluetooth.stopVoiceMode()
             bluetooth.virtualMicrophone.restoreInputOnShutdown()
             NSApp.terminate(nil)

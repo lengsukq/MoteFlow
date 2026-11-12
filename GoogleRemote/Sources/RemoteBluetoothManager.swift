@@ -56,6 +56,9 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
     var onBLEHIDReport: ((String, Data) -> Void)?
     var onATVVControlReport: ((Data) -> Void)?
     var onATVVAudioEnded: (() -> Void)?
+    var shouldRouteVoiceRemotely: (() -> Bool)?
+    var onRemoteVoiceAudioStart: ((Int) -> Void)?
+    var onRemoteVoiceSamples: (([Int16], Int) -> Void)?
 
     private static let hidService = CBUUID(string: "1812")
     private static let hidReport = CBUUID(string: "2A4D")
@@ -95,15 +98,25 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
         central = CBCentralManager(delegate: self, queue: .main)
     }
 
+    var preferredVoiceSampleRate: Int {
+        capabilities?.supports8k == true ? 8_000 : 16_000
+    }
+
     private func restoreVoicePeripheralIfPossible() {
         guard autoVoiceConnectEnabled, central.state == .poweredOn,
-              connectedDeviceID == nil,
-              let text = UserDefaults.standard.string(forKey: Self.lastVoiceDeviceKey),
-              let id = UUID(uuidString: text) else { return }
-        let peripherals = central.retrievePeripherals(withIdentifiers: [id])
-        guard let peripheral = peripherals.first else { return }
-        register(peripheral, name: peripheral.name ?? "Chromecast Remote", rssi: 0)
-        connect(to: id)
+              connectedDeviceID == nil else { return }
+        if let text = UserDefaults.standard.string(forKey: Self.lastVoiceDeviceKey),
+           let id = UUID(uuidString: text),
+           let peripheral = central.retrievePeripherals(withIdentifiers: [id]).first {
+            register(peripheral, name: peripheral.name ?? "Chromecast Remote", rssi: 0)
+            connect(to: id)
+            return
+        }
+        let systemConnected = central.retrieveConnectedPeripherals(withServices: [ATVV.service])
+        if let first = systemConnected.first {
+            register(first, name: first.name ?? "Chromecast Remote", rssi: 0)
+            connect(to: first.identifier)
+        }
     }
 
     func toggleScan() {
@@ -201,6 +214,51 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
     func waveFileData() -> Data? {
         guard !recordedSamples.isEmpty else { return nil }
         return WaveFile.pcm16(samples: recordedSamples, rate: recordingRate)
+    }
+
+    // MARK: - Incoming LAN Forwarded Voice Metrics & WAV Buffer
+
+    func beginRemoteIncomingVoice(sampleRate: Int, peerName: String?) {
+        recordedSamples.removeAll(keepingCapacity: true)
+        packetTotal = 0
+        byteTotal = 0
+        frameTotal = 0
+        levelLatest = 0
+        lastMetricsUpdate = .distantPast
+        recordedSampleCount = 0
+        audioPacketCount = 0
+        audioByteCount = 0
+        decodedFrameCount = 0
+        droppedFrameCount = 0
+        recordingRate = (sampleRate == 8_000 || sampleRate == 16_000) ? sampleRate : 8_000
+        isRecording = true
+        voiceStatus = "正在接收来自「\(peerName ?? "主控 Mac")」的遥控器语音"
+    }
+
+    func appendRemoteIncomingVoice(samples: [Int16], sampleRate: Int) {
+        guard !samples.isEmpty else { return }
+        if (sampleRate == 8_000 || sampleRate == 16_000), sampleRate != recordingRate {
+            if recordedSamples.isEmpty {
+                recordingRate = sampleRate
+            }
+        }
+        packetTotal += 1
+        frameTotal += 1
+        byteTotal += samples.count * 2
+        let remaining = recordingRate * 60 - recordedSamples.count
+        if remaining > 0 {
+            recordedSamples.append(contentsOf: samples.prefix(remaining))
+        }
+        let energy = samples.reduce(0.0) { $0 + Double($1) * Double($1) }
+        levelLatest = min(1, sqrt(energy / Double(samples.count)) / 10_000)
+        publishAudioMetrics()
+    }
+
+    func endRemoteIncomingVoice() {
+        isRecording = false
+        publishAudioMetrics(force: true)
+        audioLevel = 0
+        voiceStatus = voiceModeEnabled ? "语音按键待机 · 音频采集已关闭" : "远端语音接收已完成"
     }
 
     func toggleVoiceMode() {
@@ -366,8 +424,12 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
         droppedFrameCount = 0
         audioLevel = 0
         recordingRate = codec == 0x02 ? 16_000 : 8_000
-        virtualMicrophone.beginSession(sourceRate: recordingRate)
-        voiceStatus = "正在接收遥控器语音"
+        if shouldRouteVoiceRemotely?() == true {
+            onRemoteVoiceAudioStart?(recordingRate)
+        } else {
+            virtualMicrophone.beginSession(sourceRate: recordingRate)
+        }
+        voiceStatus = shouldRouteVoiceRemotely?() == true ? "正在接收语音并转发至远端 Mac" : "正在接收遥控器语音"
         log("AUDIO_START codec=\(codec.map { "0x" + String($0, radix: 16) } ?? "unknown")")
         keepaliveTask?.cancel()
         if capabilities?.isLegacy == false {
@@ -602,7 +664,11 @@ final class RemoteBluetoothManager: NSObject, ObservableObject {
     private func storeSamples(_ samples: [Int16]) {
         guard !samples.isEmpty else { return }
         // Live audio routing is independent of the 60-second WAV preview cap.
-        virtualMicrophone.write(samples: samples, sampleRate: recordingRate)
+        if shouldRouteVoiceRemotely?() == true {
+            onRemoteVoiceSamples?(samples, recordingRate)
+        } else {
+            virtualMicrophone.write(samples: samples, sampleRate: recordingRate)
+        }
         let remaining = recordingRate * 60 - recordedSamples.count
         if remaining > 0 {
             recordedSamples.append(contentsOf: samples.prefix(remaining))
@@ -646,7 +712,6 @@ extension RemoteBluetoothManager: CBCentralManagerDelegate {
             if !isBluetoothReady {
                 isScanning = false
                 resetATVV()
-                resetBLEHID()
                 resetBLEHID()
             }
             log(bluetoothState)

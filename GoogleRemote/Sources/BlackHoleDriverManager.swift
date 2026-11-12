@@ -38,17 +38,17 @@ final class BlackHoleDriverManager: ObservableObject {
             updateDescription(isLoaded: loaded)
             return
         }
-        Task.detached(priority: .utility) { [weak self] in
-            let result = Self.installedCaskVersion(brew: path)
-            await MainActor.run {
-                guard let self else { return }
-                self.homebrewVersion = result.brewInfo
-                self.caskVersion = result.version
-                self.checking = false
-                self.updateDescription(isLoaded: router.devices.contains {
-                    $0.name.localizedCaseInsensitiveContains("BlackHole 2ch")
-                })
-            }
+        Task { [weak self, weak router] in
+            let result = await Task.detached(priority: .utility) {
+                Self.installedCaskVersion(brew: path)
+            }.value
+            guard let self else { return }
+            self.homebrewVersion = result.brewInfo
+            self.caskVersion = result.version
+            self.checking = false
+            self.updateDescription(isLoaded: router?.devices.contains {
+                $0.name.localizedCaseInsensitiveContains("BlackHole 2ch")
+            } ?? false)
         }
     }
 

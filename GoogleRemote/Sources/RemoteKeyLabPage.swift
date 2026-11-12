@@ -50,7 +50,7 @@ struct RemoteKeyLabPage: View {
                         .textSelection(.enabled)
                     HStack(spacing: 10) {
                         Button {
-                            let granted = SystemHIDProbe.requestInputMonitoring()
+                            _ = SystemHIDProbe.requestInputMonitoring()
                             inputMonitoringStatus = SystemHIDProbe.inputMonitoringStatus
                             if inputMonitoringGranted {
                                 refreshDevices()
@@ -516,8 +516,9 @@ struct RemoteKeyLabPage: View {
         .onAppear {
             inputMonitoringStatus = SystemHIDProbe.inputMonitoringStatus
             refreshDevices()
-            bluetooth.onBLEHIDReport = { [weak monitor] characteristic, payload in
-                monitor?.recordBLEReport(characteristic: characteristic, data: payload)
+            let weakMonitor = monitor
+            bluetooth.onBLEHIDReport = { [weak weakMonitor] characteristic, payload in
+                weakMonitor?.recordBLEReport(characteristic: characteristic, data: payload)
             }
         }
         .onDisappear {

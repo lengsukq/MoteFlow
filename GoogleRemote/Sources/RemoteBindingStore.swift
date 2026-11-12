@@ -10,8 +10,8 @@ struct RemoteNamedMappingProfile: Codable, Equatable, Identifiable {
     var bindings: [RemoteKey: RemoteBinding]
 }
 
-/// Persistent, local-only mapping configuration. Nothing here installs global
-/// event taps or claims that the remote's HID events have been implemented.
+/// Persistent, local-only mapping configuration plus portable backup/export/import
+/// and local snapshot history.
 @MainActor
 final class RemoteBindingStore: ObservableObject {
     @Published private(set) var bindings: [RemoteKey: RemoteBinding] = [:]
@@ -19,18 +19,27 @@ final class RemoteBindingStore: ObservableObject {
     @Published private(set) var namedProfiles: [RemoteNamedMappingProfile] = []
     @Published private(set) var activeProfileID: UUID?
     @Published private(set) var profileError: String?
+    @Published private(set) var localBackups: [RemoteLocalBackupRecord] = []
+
     private let defaults: UserDefaults
+    private let backupDirectoryURL: URL
     private let storageKey = "GoogleRemote.keyBindings.v1"
     private let modelStorageKey = "MoteFlow.remoteModels.v1"
     private let selectedModelKey = "MoteFlow.selectedRemoteModel.v1"
     private let googleSideKeyMigrationKey = "MoteFlow.googleSideClipboardMapping.v1"
     private let profilesKey = "MoteFlow.namedMappingProfiles.v1"
     private let activeProfilesKey = "MoteFlow.activeNamedMappingProfiles.v1"
+    private static let maxLocalBackups = 12
     private var savedModels: [String: [RemoteKey: RemoteBinding]] = [:]
     private var selectedProfiles: [String: UUID] = [:]
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, backupDirectoryURL: URL? = nil) {
         self.defaults = defaults
+        self.backupDirectoryURL = backupDirectoryURL ?? FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("GoogleRemote", isDirectory: true)
+            .appendingPathComponent("ConfigBackups", isDirectory: true)
+
         if let data = defaults.data(forKey: modelStorageKey),
            let saved = try? JSONDecoder().decode([String: [RemoteKey: RemoteBinding]].self, from: data) {
             savedModels = saved
@@ -58,6 +67,7 @@ final class RemoteBindingStore: ObservableObject {
         bindings = savedModels[activeModel.id] ?? Self.factoryActionBindings(for: activeModel)
         if savedModels[activeModel.id] == nil { save() }
         migrateGoogleSideKeysIfNeeded()
+        loadLocalBackupIndex()
     }
 
     /// Model-scoped actions: switching remotes must never overwrite the user's
@@ -75,9 +85,6 @@ final class RemoteBindingStore: ObservableObject {
         migrateGoogleSideKeysIfNeeded()
     }
 
-    /// Add the two newly introduced side-key defaults to an existing Google
-    /// working mapping once, without overwriting existing user assignments or
-    /// changing named profile snapshots.
     private func migrateGoogleSideKeysIfNeeded() {
         guard activeModel == .googleG9N9N,
               !defaults.bool(forKey: googleSideKeyMigrationKey) else { return }
@@ -93,8 +100,6 @@ final class RemoteBindingStore: ObservableObject {
         if changed { save() }
     }
 
-    /// Explicitly apply/replace only the Google remote's side-key mapping
-    /// while leaving all other working bindings and named snapshots untouched.
     @discardableResult
     func applyGoogleSideKeyClipboardPreset() -> Bool {
         guard activeModel == .googleG9N9N else {
@@ -128,8 +133,6 @@ final class RemoteBindingStore: ObservableObject {
         return bindings != profile.bindings
     }
 
-    /// Applying defaults only replaces the editable working copy; it never
-    /// mutates or deletes the user's named profiles.
     func applyFactoryMapping() {
         bindings = Self.factoryActionBindings(for: activeModel)
         activeProfileID = nil
@@ -184,8 +187,6 @@ final class RemoteBindingStore: ObservableObject {
         return true
     }
 
-    /// Explicitly overwrite the saved snapshot. Normal edits only change the
-    /// working copy and therefore cannot accidentally mutate saved profiles.
     @discardableResult
     func updateActiveNamedProfile() -> Bool {
         guard let id = activeProfileID,
@@ -252,8 +253,293 @@ final class RemoteBindingStore: ObservableObject {
         save()
     }
 
-    /// Safe first-run suggestions, not unverified HID report codes.
-    /// A new device still needs a real hardware match or learning session.
+    // MARK: - Portable JSON Export / Import & Local Snapshot Backups
+
+    func exportBackupDocument(peerName: String, note: String? = nil, library: RemoteLibraryStore) -> RemoteConfigBackupDocument {
+        RemoteConfigBackupDocument(
+            note: note,
+            snapshot: exportSyncSnapshot(peerName: peerName, library: library)
+        )
+    }
+
+    func exportBackupJSONData(peerName: String, note: String? = nil, library: RemoteLibraryStore) throws -> Data {
+        try exportBackupDocument(peerName: peerName, note: note, library: library).exportJSONData()
+    }
+
+    @discardableResult
+    func createLocalBackup(
+        label: String,
+        peerName: String,
+        library: RemoteLibraryStore,
+        isAutomaticSafetyBackup: Bool = false
+    ) throws -> RemoteLocalBackupRecord {
+        try FileManager.default.createDirectory(at: backupDirectoryURL, withIntermediateDirectories: true)
+        let id = UUID()
+        let fileName = "backup-\(id.uuidString).json"
+        let doc = exportBackupDocument(peerName: peerName, note: label, library: library)
+        let data = try doc.exportJSONData()
+        try data.write(to: backupDirectoryURL.appendingPathComponent(fileName), options: .atomic)
+
+        let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let record = RemoteLocalBackupRecord(
+            id: id,
+            label: cleanLabel.isEmpty ? "手动配置备份" : String(cleanLabel.prefix(48)),
+            createdAt: Date(),
+            fileName: fileName,
+            configuredKeysCount: doc.snapshot.totalConfiguredKeyCount,
+            namedProfilesCount: doc.snapshot.namedProfiles.count,
+            libraryActionsCount: doc.snapshot.libraryActions.count,
+            isAutomaticSafetyBackup: isAutomaticSafetyBackup
+        )
+        localBackups.insert(record, at: 0)
+        pruneExcessLocalBackups()
+        persistLocalBackupIndex()
+        return record
+    }
+
+    @discardableResult
+    func restoreLocalBackup(
+        _ id: UUID,
+        strategy: RemoteConfigSyncStrategy,
+        library: RemoteLibraryStore
+    ) throws -> RemoteConfigSyncResult {
+        guard let record = localBackups.first(where: { $0.id == id }) else {
+            throw RemoteConfigBackupError.corruptedData("本地备份记录不存在或已被清理")
+        }
+        let fileURL = backupDirectoryURL.appendingPathComponent(record.fileName)
+        let data = try Data(contentsOf: fileURL)
+        let doc = try RemoteConfigBackupDocument.importJSONData(data)
+        var labeledSnapshot = doc.snapshot
+        labeledSnapshot.sourcePeerName = record.label
+        return applySyncedSnapshot(
+            labeledSnapshot,
+            strategy: strategy,
+            library: library,
+            createSafetyBackupOnOverwrite: !record.isAutomaticSafetyBackup
+        )
+    }
+
+    func deleteLocalBackup(_ id: UUID) {
+        guard let idx = localBackups.firstIndex(where: { $0.id == id }) else { return }
+        let removed = localBackups.remove(at: idx)
+        let fileURL = backupDirectoryURL.appendingPathComponent(removed.fileName)
+        try? FileManager.default.removeItem(at: fileURL)
+        persistLocalBackupIndex()
+    }
+
+    private var backupIndexURL: URL {
+        backupDirectoryURL.appendingPathComponent("index.json")
+    }
+
+    private func loadLocalBackupIndex() {
+        guard FileManager.default.fileExists(atPath: backupIndexURL.path),
+              let data = try? Data(contentsOf: backupIndexURL),
+              let decoded = try? JSONDecoder().decode([RemoteLocalBackupRecord].self, from: data) else {
+            return
+        }
+        localBackups = decoded.filter {
+            FileManager.default.fileExists(atPath: backupDirectoryURL.appendingPathComponent($0.fileName).path)
+        }
+    }
+
+    private func pruneExcessLocalBackups() {
+        while localBackups.count > Self.maxLocalBackups {
+            let oldest = localBackups.removeLast()
+            try? FileManager.default.removeItem(at: backupDirectoryURL.appendingPathComponent(oldest.fileName))
+        }
+    }
+
+    private func persistLocalBackupIndex() {
+        try? FileManager.default.createDirectory(at: backupDirectoryURL, withIntermediateDirectories: true)
+        if let data = try? JSONEncoder().encode(localBackups) {
+            try? data.write(to: backupIndexURL, options: .atomic)
+        }
+    }
+
+    // MARK: - Dual-Mac Configuration Export & Merge / Overwrite Sync
+
+    func exportSyncSnapshot(peerName: String, library: RemoteLibraryStore) -> RemoteSyncConfigSnapshot {
+        var allModels = savedModels
+        allModels[activeModel.id] = bindings
+        for model in RemoteDeviceModel.allCases where allModels[model.id] == nil {
+            allModels[model.id] = Self.factoryActionBindings(for: model)
+        }
+        return RemoteSyncConfigSnapshot(
+            sourcePeerName: peerName,
+            exportedAt: Date(),
+            activeModel: activeModel,
+            modelBindings: allModels,
+            namedProfiles: namedProfiles,
+            libraryActions: library.exportSyncableActions()
+        ).sanitized()
+    }
+
+    @discardableResult
+    func applySyncedSnapshot(
+        _ rawSnapshot: RemoteSyncConfigSnapshot,
+        strategy: RemoteConfigSyncStrategy,
+        library: RemoteLibraryStore,
+        createSafetyBackupOnOverwrite: Bool = true
+    ) -> RemoteConfigSyncResult {
+        let snapshot = rawSnapshot.sanitized()
+        savedModels[activeModel.id] = bindings
+
+        var createdSafety = false
+        if strategy == .overwrite && createSafetyBackupOnOverwrite {
+            let localHost = Host.current().localizedName ?? "本机"
+            if (try? createLocalBackup(
+                label: "覆盖前自动保护备份",
+                peerName: localHost,
+                library: library,
+                isAutomaticSafetyBackup: true
+            )) != nil {
+                createdSafety = true
+            }
+        }
+
+        let syncedLibraryCount = library.applySyncedActions(snapshot.libraryActions, strategy: strategy)
+        var updatedGestures = 0
+
+        switch strategy {
+        case .merge:
+            for (modelID, remoteMap) in snapshot.modelBindings {
+                guard RemoteDeviceModel(rawValue: modelID) != nil else { continue }
+                var localMap = savedModels[modelID] ?? [:]
+                for (key, remoteBinding) in remoteMap {
+                    var current = localMap[key] ?? RemoteBinding()
+                    var changedKey = false
+                    for gesture in RemoteGesture.allCases {
+                        let localAction = current.action(for: gesture)
+                        let incomingAction = remoteBinding.action(for: gesture)
+                        if !Self.isActionConfigured(localAction) && Self.isActionConfigured(incomingAction) {
+                            current.setAction(incomingAction, for: gesture)
+                            updatedGestures += 1
+                            changedKey = true
+                        }
+                    }
+                    if changedKey && current.longPressThreshold == nil,
+                       let remoteThreshold = remoteBinding.longPressThreshold {
+                        current.longPressThreshold = remoteThreshold
+                    }
+                    if current.isConfigured || localMap[key] != nil {
+                        localMap[key] = current
+                    }
+                }
+                savedModels[modelID] = localMap
+            }
+
+        case .overwrite:
+            activeModel = snapshot.activeModel
+            defaults.set(activeModel.id, forKey: selectedModelKey)
+            for (modelID, remoteMap) in snapshot.modelBindings {
+                guard RemoteDeviceModel(rawValue: modelID) != nil else { continue }
+                var nextMap: [RemoteKey: RemoteBinding] = [:]
+                let previousMap = savedModels[modelID] ?? [:]
+                let allKeys = Set(previousMap.keys).union(remoteMap.keys)
+                for key in allKeys {
+                    let prev = previousMap[key] ?? RemoteBinding()
+                    var incoming = remoteMap[key] ?? RemoteBinding()
+                    for gesture in RemoteGesture.allCases {
+                        if prev.action(for: gesture).kind == .script &&
+                            !Self.isActionConfigured(incoming.action(for: gesture)) {
+                            incoming.setAction(prev.action(for: gesture), for: gesture)
+                        } else if prev.action(for: gesture) != incoming.action(for: gesture) {
+                            updatedGestures += 1
+                        }
+                    }
+                    if incoming.isConfigured {
+                        nextMap[key] = incoming
+                    }
+                }
+                savedModels[modelID] = nextMap
+            }
+            activeProfileID = nil
+            selectedProfiles.removeValue(forKey: activeModel.id)
+        }
+
+        // Sync named mapping profiles
+        var syncedProfileCount = 0
+        for incomingProfile in snapshot.namedProfiles {
+            guard RemoteDeviceModel(rawValue: incomingProfile.modelID) != nil else { continue }
+            let baseName = String(incomingProfile.name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))
+            guard !baseName.isEmpty else { continue }
+
+            if let idx = namedProfiles.firstIndex(where: { $0.id == incomingProfile.id }) {
+                if strategy == .overwrite && namedProfiles[idx] != incomingProfile {
+                    namedProfiles[idx] = RemoteNamedMappingProfile(
+                        id: incomingProfile.id,
+                        name: baseName,
+                        modelID: incomingProfile.modelID,
+                        bindings: incomingProfile.bindings
+                    )
+                    syncedProfileCount += 1
+                }
+            } else {
+                var finalName = baseName
+                if let nameClashIdx = namedProfiles.firstIndex(where: {
+                    $0.modelID == incomingProfile.modelID &&
+                    $0.name.localizedCaseInsensitiveCompare(baseName) == .orderedSame
+                }) {
+                    if strategy == .overwrite {
+                        namedProfiles[nameClashIdx] = RemoteNamedMappingProfile(
+                            id: incomingProfile.id,
+                            name: baseName,
+                            modelID: incomingProfile.modelID,
+                            bindings: incomingProfile.bindings
+                        )
+                        syncedProfileCount += 1
+                        continue
+                    } else {
+                        let suffix = "（来自\(snapshot.sourcePeerName.prefix(8))）"
+                        finalName = String(baseName.prefix(max(1, 40 - suffix.count))) + suffix
+                    }
+                }
+                if !namedProfiles.contains(where: {
+                    $0.modelID == incomingProfile.modelID &&
+                    $0.name.localizedCaseInsensitiveCompare(finalName) == .orderedSame
+                }) {
+                    namedProfiles.append(RemoteNamedMappingProfile(
+                        id: incomingProfile.id,
+                        name: finalName,
+                        modelID: incomingProfile.modelID,
+                        bindings: incomingProfile.bindings
+                    ))
+                    syncedProfileCount += 1
+                }
+            }
+        }
+
+        bindings = savedModels[activeModel.id] ?? Self.factoryActionBindings(for: activeModel)
+        profileError = nil
+        save()
+
+        return RemoteConfigSyncResult(
+            strategy: strategy,
+            sourcePeerName: snapshot.sourcePeerName,
+            updatedKeyGestureCount: updatedGestures,
+            syncedProfileCount: syncedProfileCount,
+            syncedLibraryActionCount: syncedLibraryCount,
+            createdSafetyBackup: createdSafety
+        )
+    }
+
+    private static func isActionConfigured(_ action: RemoteAction) -> Bool {
+        switch action.kind {
+        case .none:
+            false
+        case .keyboardShortcut:
+            action.shortcut != nil
+        case .systemAction:
+            action.systemAction != nil
+        case .libraryAction:
+            action.presetID != nil
+        case .script:
+            action.scriptPath != nil || action.scriptID != nil
+        case .voiceInput:
+            true
+        }
+    }
+
     static func factoryActionBindings(for model: RemoteDeviceModel) -> [RemoteKey: RemoteBinding] {
         if model == .googleG9N9N {
             let directions: [(RemoteKey, UInt16, String)] = [
@@ -294,8 +580,6 @@ final class RemoteBindingStore: ObservableObject {
                 longPressAction: RemoteAction(kind: .systemAction,
                                               systemAction: .selectAllAndPaste)
             )
-            // Power, apps, voice and media keys are intentionally left empty:
-            // generic virtual keyboard events cannot safely implement them.
             return mapping
         }
         guard model == .xiaomiRemote2 || model == .xiaomiRemote2Pro else { return [:] }
@@ -310,8 +594,6 @@ final class RemoteBindingStore: ObservableObject {
                 command: false, shift: false, option: false, control: false
             )))
         })
-        // Home opens the same editable action-library ChatGPT preset as the
-        // existing MoteFlow workflow. No action runs until users opt in.
         seeded[.home] = RemoteBinding(
             kind: .libraryAction, presetID: RemoteLibraryStore.chatGPTPresetID
         )
@@ -363,7 +645,6 @@ final class RemoteBindingStore: ObservableObject {
         }
     }
 
-    /// The caller must explicitly confirm replacing a conflicting mapping.
     func setShortcut(_ shortcut: RemoteShortcut, for key: RemoteKey,
                      replaceConflict: Bool = false) -> Bool {
         setShortcut(shortcut, for: key, gesture: .tap, replaceConflict: replaceConflict)
@@ -440,8 +721,6 @@ final class RemoteBindingStore: ObservableObject {
         let profile = RemoteProfile(bindings: bindings)
         guard let encoded = try? JSONEncoder().encode(profile) else { return }
         savedModels[activeModel.id] = bindings
-        // Only Google maps are written to the legacy key; a Xiaomi selection
-        // must not destroy legacy user data.
         if activeModel == .googleG9N9N { defaults.set(encoded, forKey: storageKey) }
         if let all = try? JSONEncoder().encode(savedModels) {
             defaults.set(all, forKey: modelStorageKey)

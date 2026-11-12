@@ -38,6 +38,7 @@ enum RemoteSystemAction: String, Codable, CaseIterable, Identifiable {
     case selectAllAndPaste
     case undo
     case redo
+    case switchMacTarget
 
     var id: String { rawValue }
     /// Composite actions are executed sequentially, never repeated on hold.
@@ -63,6 +64,7 @@ enum RemoteSystemAction: String, Codable, CaseIterable, Identifiable {
         case .selectAllAndPaste: "全选后粘贴"
         case .undo: "撤销"
         case .redo: "重做"
+        case .switchMacTarget: "切换双机目标（本机 ⇄ 另一台 Mac）"
         }
     }
 

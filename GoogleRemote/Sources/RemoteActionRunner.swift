@@ -153,12 +153,13 @@ final class RemoteActionRunner: ObservableObject {
     @Published private(set) var running = false
     @Published private(set) var result = "尚未试运行"
     @Published private(set) var voiceShortcutHeld = false
+    var onSwitchMacTarget: (() -> Void)?
     private var voiceKeyUp: CGEvent?
     private var heldVoiceShortcut: RemoteShortcut?
     private var mappedHold: (id: UUID, key: RemoteKey, shortcut: RemoteShortcut, keyUp: CGEvent)?
     private var mappedHoldWatchdog: Task<Void, Never>?
     private var mappedRepeatTask: Task<Void, Never>?
-    private var pendingMappedActions: [(action: RemoteAction, label: String, library: RemoteLibraryStore)] = []
+    private var pendingMappedActions: [(action: RemoteAction, label: String, library: RemoteLibraryStore, inlineSteps: [RemoteActionStep]?)] = []
 
     private static func flags(for shortcut: RemoteShortcut) -> CGEventFlags {
         var flags: CGEventFlags = []
@@ -240,7 +241,7 @@ final class RemoteActionRunner: ObservableObject {
                 else { continuation.resume(throwing: RemoteExecutionError.appLaunchFailed("系统没有返回进程")) }
             }
         }
-        _ = running.activate(options: [.activateIgnoringOtherApps])
+        _ = running.activate()
     }
 
     /// Doubao's configurable hold-to-dictate hotkey. This controls Doubao
@@ -359,12 +360,17 @@ final class RemoteActionRunner: ObservableObject {
     /// HID releases can arrive much faster than the macOS key-up timer.
     /// Never discard a short tap because a previous mapped action is running.
     func enqueueMappedAction(_ action: RemoteAction, label: String, library: RemoteLibraryStore) {
-        // A bounded queue avoids runaway execution if a remote repeats unexpectedly.
         guard pendingMappedActions.count < 24 else {
             result = "连续按键过多，已限制待执行动作队列"
             return
         }
-        pendingMappedActions.append((action, label, library))
+        pendingMappedActions.append((action, label, library, nil))
+        drainMappedActions()
+    }
+
+    func enqueueForwardedSteps(_ steps: [RemoteActionStep], label: String, library: RemoteLibraryStore) {
+        guard !steps.isEmpty, pendingMappedActions.count < 24 else { return }
+        pendingMappedActions.append((RemoteAction(kind: .libraryAction), label, library, steps))
         drainMappedActions()
     }
 
@@ -376,7 +382,7 @@ final class RemoteActionRunner: ObservableObject {
         guard !running && !voiceShortcutHeld && mappedHold == nil,
               !pendingMappedActions.isEmpty else { return }
         let next = pendingMappedActions.removeFirst()
-        test(action: next.action, label: next.label, library: next.library)
+        test(action: next.action, label: next.label, library: next.library, inlineSteps: next.inlineSteps)
     }
 
     /// One short key down/up pair. No held state remains after the tap.
@@ -392,7 +398,47 @@ final class RemoteActionRunner: ObservableObject {
         }
     }
 
-    func test(action: RemoteAction, label: String, library: RemoteLibraryStore) {
+    /// Inserts offline-transcribed speech text at the current cursor when the
+    /// receiving Mac does not have BlackHole 2ch installed, preserving clipboard text.
+    func insertRecognizedText(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let pb = NSPasteboard.general
+        let previousText = pb.string(forType: .string)
+        pb.clearContents()
+        pb.setString(trimmed, forType: .string)
+
+        guard AXIsProcessTrusted() && CGPreflightPostEventAccess() else {
+            result = "已识别语音并复制到剪贴板（授权辅助功能后可自动输入）：\(trimmed)"
+            return
+        }
+
+        let pasteShortcut = RemoteShortcut(
+            keyCode: 9, // 'V'
+            keyLabel: "V",
+            command: true,
+            shift: false,
+            option: false,
+            control: false
+        )
+        Task {
+            do {
+                try await emitKeyboard(pasteShortcut, holdSeconds: 0.06)
+                result = "已自动输入远端语音识别文字：\(trimmed)"
+                try? await Task.sleep(for: .milliseconds(320))
+                if pb.string(forType: .string) == trimmed {
+                    pb.clearContents()
+                    if let previousText {
+                        pb.setString(previousText, forType: .string)
+                    }
+                }
+            } catch {
+                result = "语音文字已复制到剪贴板，自动粘贴失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    func test(action: RemoteAction, label: String, library: RemoteLibraryStore, inlineSteps: [RemoteActionStep]? = nil) {
         guard !running && !voiceShortcutHeld && mappedHold == nil else { return }
         running = true
         result = "正在执行：\(label)"
@@ -405,10 +451,16 @@ final class RemoteActionRunner: ObservableObject {
                     guard let native = action.systemAction else {
                         throw RemoteExecutionError.systemActionUnavailable("未选择系统动作")
                     }
-                    try await RemoteSystemActionExecutor.executeSystemAction(native)
-                    result = "已请求系统动作：\(native.title)"
+                    if native == .switchMacTarget {
+                        onSwitchMacTarget?()
+                        result = "已触发双机控制目标切换"
+                    } else {
+                        try await RemoteSystemActionExecutor.executeSystemAction(native)
+                        result = "已请求系统动作：\(native.title)"
+                    }
                 } else {
-                    guard let steps = library.steps(for: action), !steps.isEmpty
+                    let resolvedSteps = inlineSteps ?? library.steps(for: action)
+                    guard let steps = resolvedSteps, !steps.isEmpty
                     else { throw RemoteExecutionError.missingLibraryAction }
                     for (index, step) in steps.enumerated() {
                         switch step.kind {

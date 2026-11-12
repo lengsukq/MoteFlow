@@ -162,6 +162,69 @@ final class RemoteLibraryStore: ObservableObject {
         persist()
     }
 
+    /// Exports safe, script-free library actions for Dual-Mac configuration sync.
+    func exportSyncableActions() -> [RemoteLibraryAction] {
+        actions.compactMap { item in
+            let safeSteps = item.steps.filter { $0.kind != .script }
+            guard !safeSteps.isEmpty else { return nil }
+            return RemoteLibraryAction(
+                id: item.id,
+                name: item.name,
+                steps: safeSteps,
+                modifiedAt: item.modifiedAt
+            )
+        }
+    }
+
+    /// Applies incoming library actions from a connected Mac using either
+    /// `.merge` (only add missing IDs) or `.overwrite` (update existing safe items and add new ones,
+    /// while preserving any purely local script actions).
+    @discardableResult
+    func applySyncedActions(_ incoming: [RemoteLibraryAction], strategy: RemoteConfigSyncStrategy) -> Int {
+        var appliedCount = 0
+        for candidate in incoming {
+            let safeSteps = candidate.steps.filter { step in
+                switch step.kind {
+                case .keyboard:
+                    return step.shortcut != nil && (0.04...10).contains(step.holdSeconds)
+                case .wait:
+                    return (0...30).contains(step.waitSeconds)
+                case .openApp:
+                    let id = step.applicationBundleID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    return !id.isEmpty && id.count < 240 && !id.contains("/") && !id.contains(" ")
+                case .script:
+                    return false
+                }
+            }
+            let cleanName = candidate.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanName.isEmpty, !safeSteps.isEmpty, safeSteps.count <= 30 else { continue }
+            let sanitizedItem = RemoteLibraryAction(
+                id: candidate.id,
+                name: cleanName,
+                steps: safeSteps,
+                modifiedAt: candidate.modifiedAt
+            )
+
+            if let existingIdx = actions.firstIndex(where: { $0.id == sanitizedItem.id }) {
+                if strategy == .overwrite {
+                    // Never clobber a local action that contains local scripts.
+                    let existingHasScript = actions[existingIdx].steps.contains { $0.kind == .script }
+                    if !existingHasScript && actions[existingIdx] != sanitizedItem {
+                        actions[existingIdx] = sanitizedItem
+                        appliedCount += 1
+                    }
+                }
+            } else {
+                actions.append(sanitizedItem)
+                appliedCount += 1
+            }
+        }
+        if appliedCount > 0 {
+            persist()
+        }
+        return appliedCount
+    }
+
     func description(for action: RemoteAction) -> String {
         if action.kind == .libraryAction {
             return self.action(action.presetID)?.name ?? "动作已删除，请重新选择"

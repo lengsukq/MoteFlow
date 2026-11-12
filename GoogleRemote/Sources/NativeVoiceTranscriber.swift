@@ -2,8 +2,8 @@ import Combine
 import Foundation
 import Speech
 
-/// Explicit opt-in transcription of an already-decoded WAV recording.
-/// This service never opens the Mac microphone and never falls back to a network recognizer.
+/// Explicit opt-in or LAN-fallback local transcription of a decoded WAV recording.
+/// Never opens the Mac physical microphone and never falls back to a cloud recognizer.
 @MainActor
 final class NativeVoiceTranscriber: ObservableObject {
     @Published var transcript = ""
@@ -15,25 +15,43 @@ final class NativeVoiceTranscriber: ObservableObject {
     private var tempRecordingURL: URL?
     private var activeRequest = UUID()
 
-    func recognize(waveData: Data) {
-        guard !isProcessing else { return }
+    func recognize(
+        waveData: Data,
+        onFinalTranscript: ((String) -> Void)? = nil,
+        onFailure: ((String) -> Void)? = nil
+    ) {
+        if isProcessing {
+            cancel()
+        }
         switch SFSpeechRecognizer.authorizationStatus() {
         case .authorized:
-            performRecognition(waveData: waveData)
+            performRecognition(
+                waveData: waveData,
+                onFinalTranscript: onFinalTranscript,
+                onFailure: onFailure
+            )
         case .notDetermined:
             status = "等待系统语音识别授权"
             SFSpeechRecognizer.requestAuthorization { [weak self] permission in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     if permission == .authorized {
-                        self.performRecognition(waveData: waveData)
+                        self.performRecognition(
+                            waveData: waveData,
+                            onFinalTranscript: onFinalTranscript,
+                            onFailure: onFailure
+                        )
                     } else {
-                        self.status = "未获得语音识别权限，请到系统设置 → 隐私与安全性 → 语音识别授权"
+                        let msg = "未授权本地语音识别（可在「权限引导」开启，或安装 BlackHole 2ch 配合豆包使用）"
+                        self.status = msg
+                        onFailure?(msg)
                     }
                 }
             }
         default:
-            status = "语音识别权限被拒绝，请到系统设置 → 隐私与安全性 → 语音识别授权"
+            let msg = "本地语音识别权限未开启（请到「权限引导」开启，或安装 BlackHole 2ch 配合豆包使用）"
+            status = msg
+            onFailure?(msg)
         }
     }
 
@@ -46,13 +64,21 @@ final class NativeVoiceTranscriber: ObservableObject {
         status = "已取消识别"
     }
 
-    private func performRecognition(waveData: Data) {
+    private func performRecognition(
+        waveData: Data,
+        onFinalTranscript: ((String) -> Void)?,
+        onFailure: ((String) -> Void)?
+    ) {
         guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: language)) else {
-            status = "macOS 不支持此识别语言"
+            let msg = "macOS 不支持此识别语言"
+            status = msg
+            onFailure?(msg)
             return
         }
         guard recognizer.isAvailable, recognizer.supportsOnDeviceRecognition else {
-            status = "本机缺少该语言的离线识别能力；请检查系统语言/听写资源。未尝试在线识别。"
+            let msg = "本机缺少离线听写语音资源（可在系统键盘听写设置下载，或安装 BlackHole 2ch 配合豆包使用）"
+            status = msg
+            onFailure?(msg)
             return
         }
         let url = FileManager.default.temporaryDirectory
@@ -60,7 +86,9 @@ final class NativeVoiceTranscriber: ObservableObject {
         do {
             try waveData.write(to: url, options: .atomic)
         } catch {
-            status = "无法准备待识别录音：\(error.localizedDescription)"
+            let msg = "无法准备待识别录音：\(error.localizedDescription)"
+            status = msg
+            onFailure?(msg)
             return
         }
 
@@ -70,7 +98,7 @@ final class NativeVoiceTranscriber: ObservableObject {
         let requestID = activeRequest
         tempRecordingURL = url
         transcript = ""
-        status = "使用 macOS 本地语音识别中…"
+        status = "正在调用 macOS 本地引擎识别远端语音…"
         isProcessing = true
 
         let request = SFSpeechURLRecognitionRequest(url: url)
@@ -80,19 +108,28 @@ final class NativeVoiceTranscriber: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.isProcessing, self.activeRequest == requestID else { return }
                 if let result {
-                    self.transcript = result.bestTranscription.formattedString
+                    let formatted = result.bestTranscription.formattedString
+                    self.transcript = formatted
                     if result.isFinal {
                         self.status = "识别完成（本地）"
                         self.isProcessing = false
                         self.recognitionTask = nil
                         self.cleanup()
+                        let trimmed = formatted.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty {
+                            onFinalTranscript?(trimmed)
+                        } else {
+                            onFailure?("未识别到清晰语音内容")
+                        }
                     }
                 }
                 if let error, self.isProcessing {
-                    self.status = "本地识别失败：\(error.localizedDescription)"
+                    let msg = "本地识别未检出语音：\(error.localizedDescription)"
+                    self.status = msg
                     self.isProcessing = false
                     self.recognitionTask = nil
                     self.cleanup()
+                    onFailure?(msg)
                 }
             }
         }
