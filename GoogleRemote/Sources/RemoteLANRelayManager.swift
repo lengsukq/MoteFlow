@@ -45,6 +45,9 @@ final class RemoteLANRelayManager: ObservableObject {
             }
         }
     }
+    @Published var switchHUDEnabled: Bool {
+        didSet { defaults.set(switchHUDEnabled, forKey: Self.switchHUDKey) }
+    }
     @Published var switchNotificationsEnabled: Bool {
         didSet {
             defaults.set(switchNotificationsEnabled, forKey: Self.switchNotifyKey)
@@ -167,6 +170,7 @@ final class RemoteLANRelayManager: ObservableObject {
     private static let allowIncomingKey = "MoteFlow.lanRelay.allowIncoming.v1"
     private static let autoConnectKey = "MoteFlow.lanRelay.autoConnectTrusted.v1"
     private static let dispatchModeKey = "MoteFlow.lanRelay.dispatchMode.v1"
+    private static let switchHUDKey = "MoteFlow.lanRelay.switchHUD.v1"
     private static let switchNotifyKey = "MoteFlow.lanRelay.switchNotifications.v1"
     private static let switchSoundKey = "MoteFlow.lanRelay.switchSound.v1"
     private static let hotkeyEnabledKey = "MoteFlow.lanRelay.switchHotkeyEnabled.v1"
@@ -191,6 +195,7 @@ final class RemoteLANRelayManager: ObservableObject {
 
         allowIncomingControl = defaults.object(forKey: Self.allowIncomingKey) as? Bool ?? true
         autoConnectTrustedPeer = defaults.object(forKey: Self.autoConnectKey) as? Bool ?? true
+        switchHUDEnabled = defaults.object(forKey: Self.switchHUDKey) as? Bool ?? true
         switchNotificationsEnabled = defaults.object(forKey: Self.switchNotifyKey) as? Bool ?? true
         switchSoundEnabled = defaults.object(forKey: Self.switchSoundKey) as? Bool ?? true
         dispatchMode = RemoteRelayDispatchMode(
@@ -328,7 +333,8 @@ final class RemoteLANRelayManager: ObservableObject {
     func previewLocalSwitchNotification() {
         RemoteSwitchNotificationCenter.shared.notifySwitchedToThisMac(
             thisMacName: localPeerName,
-            detail: "通知预览 · 切换到本机时将收到此系统通知与横幅提示",
+            detail: "通知预览 · 按当前「悬浮提示 / 系统通知 / 提示音」设置展示",
+            hudEnabled: switchHUDEnabled,
             systemNotificationEnabled: switchNotificationsEnabled,
             soundEnabled: switchSoundEnabled
         )
@@ -345,6 +351,7 @@ final class RemoteLANRelayManager: ObservableObject {
     }
 
     func setTarget(_ target: RemoteControlTarget, showHUD: Bool = true) {
+        let shouldShowHUD = showHUD && switchHUDEnabled
         if target == .remoteMac {
             guard isConnected && isAuthenticatedSession else {
                 activeTarget = .localMac
@@ -353,13 +360,17 @@ final class RemoteLANRelayManager: ObservableObject {
                     if showHUD {
                         RemoteSwitchNotificationCenter.shared.notifyWarning(
                             title: "正在自动连接已配对的「\(candidate.name)」…",
-                            detail: "连通后再次按 \(switchShortcut.display) 即可切换"
+                            detail: "连通后再次按 \(switchShortcut.display) 即可切换",
+                            hudEnabled: shouldShowHUD,
+                            soundEnabled: switchSoundEnabled
                         )
                     }
                 } else if showHUD {
                     RemoteSwitchNotificationCenter.shared.notifyWarning(
                         title: "尚未连接另一台 Mac · 当前仍在「\(localPeerName)」",
-                        detail: "请先在「双机互联」页面点击另一台 Mac 完成配对连接"
+                        detail: "请先在「双机互联」页面点击另一台 Mac 完成配对连接",
+                        hudEnabled: shouldShowHUD,
+                        soundEnabled: switchSoundEnabled
                     )
                 }
                 return
@@ -373,6 +384,7 @@ final class RemoteLANRelayManager: ObservableObject {
                 RemoteSwitchNotificationCenter.shared.notifySwitchedToOtherMac(
                     otherMacName: peerTitle,
                     detail: "遥控器已转发至「\(peerTitle)」· 按 \(switchShortcut.display) 切回本机",
+                    hudEnabled: shouldShowHUD,
                     systemNotificationEnabled: switchNotificationsEnabled,
                     soundEnabled: switchSoundEnabled
                 )
@@ -389,6 +401,7 @@ final class RemoteLANRelayManager: ObservableObject {
                 RemoteSwitchNotificationCenter.shared.notifySwitchedToThisMac(
                     thisMacName: localPeerName,
                     detail: "遥控器现在直接控制这台 Mac（\(localPeerName)）",
+                    hudEnabled: shouldShowHUD,
                     systemNotificationEnabled: switchNotificationsEnabled,
                     soundEnabled: switchSoundEnabled
                 )
@@ -945,6 +958,7 @@ final class RemoteLANRelayManager: ObservableObject {
                     RemoteSwitchNotificationCenter.shared.notifySwitchedToOtherMac(
                         otherMacName: controllerName,
                         detail: "遥控器已切回主控端「\(controllerName)」",
+                        hudEnabled: switchHUDEnabled,
                         systemNotificationEnabled: switchNotificationsEnabled,
                         soundEnabled: switchSoundEnabled
                     )
@@ -953,6 +967,7 @@ final class RemoteLANRelayManager: ObservableObject {
                 RemoteSwitchNotificationCenter.shared.notifySwitchedToThisMac(
                     thisMacName: localPeerName,
                     detail: "来自「\(controllerName)」的遥控器转发已切入这台 Mac",
+                    hudEnabled: switchHUDEnabled,
                     systemNotificationEnabled: switchNotificationsEnabled,
                     soundEnabled: switchSoundEnabled
                 )
@@ -1457,6 +1472,7 @@ final class RemoteLANRelayManager: ObservableObject {
                 RemoteSwitchNotificationCenter.shared.notifySwitchedToThisMac(
                     thisMacName: localPeerName,
                     detail: "远端连接中断（\(reason)），遥控器已自动切回本机",
+                    hudEnabled: switchHUDEnabled,
                     systemNotificationEnabled: switchNotificationsEnabled,
                     soundEnabled: switchSoundEnabled
                 )

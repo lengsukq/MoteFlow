@@ -242,8 +242,8 @@ final class RemotePermissionCenter: ObservableObject {
             kind: .accessibility,
             state: axTrusted ? .granted : .denied,
             statusDetail: axTrusted
-                ? "已授权 · 键盘快捷键模拟、长按连发与跨应用菜单均可用"
-                : "尚未添加权限 · 点击「弹出授权提示」并在系统设置「辅助功能」中打开 MoteFlow 开关",
+                ? "已授权 · 键盘快捷键模拟、长按连发与跨应用菜单均可用（如刚勾选后仍无效，请点上方「重启 MoteFlow」）"
+                : "尚未添加权限 · 点击「弹出授权提示」并在系统设置「辅助功能」中打开 MoteFlow 开关（勾选后可能需要重启应用生效）",
             primaryActionTitle: axTrusted ? nil : "弹出授权提示",
             settingsActionTitle: "打开辅助功能设置"
         ))
@@ -483,11 +483,21 @@ final class RemotePermissionCenter: ObservableObject {
     func relaunchApplication() {
         let appURL = Bundle.main.bundleURL
         guard appURL.pathExtension.lowercased() == "app" else { return }
-        let config = NSWorkspace.OpenConfiguration()
-        config.createsNewApplicationInstance = true
-        NSWorkspace.shared.openApplication(at: appURL, configuration: config) { _, _ in
-            Task { @MainActor in
-                NSApp.terminate(nil)
+        // Spawn a short delayed open and terminate first so the current instance
+        // cleanly releases port 49280, HID exclusive handles, and audio queues.
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", "sleep 0.45 && /usr/bin/open -n \"$1\"", "_", appURL.path]
+        do {
+            try task.run()
+            NSApp.terminate(nil)
+        } catch {
+            let config = NSWorkspace.OpenConfiguration()
+            config.createsNewApplicationInstance = true
+            NSWorkspace.shared.openApplication(at: appURL, configuration: config) { _, _ in
+                Task { @MainActor in
+                    NSApp.terminate(nil)
+                }
             }
         }
     }
@@ -598,13 +608,22 @@ struct RemotePermissionsPage: View {
 
                     Spacer(minLength: 8)
 
-                    Button {
-                        permissionCenter.refresh(bluetooth: bluetooth, lanRelay: lanRelay)
-                        hidCapture.tryAutomaticCapture()
-                    } label: {
-                        Label("刷新检测", systemImage: "arrow.clockwise")
+                    HStack(spacing: 8) {
+                        Button {
+                            permissionCenter.refresh(bluetooth: bluetooth, lanRelay: lanRelay)
+                            hidCapture.tryAutomaticCapture()
+                        } label: {
+                            Label("刷新检测", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(RemoteActionButtonStyle(emphasized: permissionCenter.missingCoreCount > 0))
+
+                        Button {
+                            permissionCenter.relaunchApplication()
+                        } label: {
+                            Label("重启 MoteFlow", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .buttonStyle(RemoteActionButtonStyle())
                     }
-                    .buttonStyle(RemoteActionButtonStyle(emphasized: permissionCenter.missingCoreCount > 0))
                 }
 
                 HStack(spacing: 8) {
@@ -797,7 +816,7 @@ struct RemotePermissionsPage: View {
                     Button {
                         permissionCenter.relaunchApplication()
                     } label: {
-                        Label("重启 MoteFlow 使输入监控生效", systemImage: "arrow.triangle.2.circlepath")
+                        Label("重启 MoteFlow 使权限生效", systemImage: "arrow.triangle.2.circlepath")
                     }
                     .buttonStyle(RemoteActionButtonStyle())
 

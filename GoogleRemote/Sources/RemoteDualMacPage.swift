@@ -642,19 +642,30 @@ struct RemoteDualMacPage: View {
                     Toggle("允许已配对的 Mac 向本机发送遥控指令", isOn: $lanRelay.allowIncomingControl)
                         .toggleStyle(.switch)
                         .font(.system(size: 12))
-                    Toggle("切换到本机或远端时弹出 macOS 系统通知提醒", isOn: $lanRelay.switchNotificationsEnabled)
+
+                    Divider().opacity(0.35)
+
+                    Toggle("切换时显示屏幕顶部悬浮提示", isOn: $lanRelay.switchHUDEnabled)
+                        .toggleStyle(.switch)
+                        .font(.system(size: 12))
+                    Toggle("切换时弹出 macOS 系统通知", isOn: $lanRelay.switchNotificationsEnabled)
                         .toggleStyle(.switch)
                         .font(.system(size: 12))
                     HStack {
-                        Toggle("切换设备时播放清脆提示音", isOn: $lanRelay.switchSoundEnabled)
+                        Toggle("切换时播放提示音", isOn: $lanRelay.switchSoundEnabled)
                             .toggleStyle(.switch)
                             .font(.system(size: 12))
                         Spacer()
-                        Button("预览本机切换通知") {
+                        Button("预览切换效果") {
                             lanRelay.previewLocalSwitchNotification()
                         }
                         .buttonStyle(.link)
                         .font(.system(size: 11))
+                    }
+                    if !lanRelay.switchHUDEnabled && !lanRelay.switchNotificationsEnabled && !lanRelay.switchSoundEnabled {
+                        Text("当前已设为完全静默切换（不弹窗、不通知、无提示音）。")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
                     }
                 }
             }

@@ -193,15 +193,18 @@ final class RemoteSwitchNotificationCenter: NSObject, UNUserNotificationCenterDe
     func notifySwitchedToThisMac(
         thisMacName: String,
         detail: String,
+        hudEnabled: Bool = true,
         systemNotificationEnabled: Bool,
         soundEnabled: Bool
     ) {
-        RemoteSwitchHUDController.shared.show(
-            title: "当前控制本机：\(thisMacName)",
-            subtitle: detail,
-            symbol: "desktopcomputer",
-            tint: RemotePalette.positive
-        )
+        if hudEnabled {
+            RemoteSwitchHUDController.shared.show(
+                title: "当前控制本机：\(thisMacName)",
+                subtitle: detail,
+                symbol: "desktopcomputer",
+                tint: RemotePalette.positive
+            )
+        }
         if soundEnabled {
             NSSound(named: NSSound.Name("Glass"))?.play()
         }
@@ -218,15 +221,18 @@ final class RemoteSwitchNotificationCenter: NSObject, UNUserNotificationCenterDe
     func notifySwitchedToOtherMac(
         otherMacName: String,
         detail: String,
+        hudEnabled: Bool = true,
         systemNotificationEnabled: Bool,
         soundEnabled: Bool
     ) {
-        RemoteSwitchHUDController.shared.show(
-            title: "已转发至：\(otherMacName)",
-            subtitle: detail,
-            symbol: "macbook.and.ipad",
-            tint: RemotePalette.turquoise
-        )
+        if hudEnabled {
+            RemoteSwitchHUDController.shared.show(
+                title: "已转发至：\(otherMacName)",
+                subtitle: detail,
+                symbol: "macbook.and.ipad",
+                tint: RemotePalette.turquoise
+            )
+        }
         if soundEnabled {
             NSSound(named: NSSound.Name("Tink"))?.play()
         }
@@ -239,14 +245,23 @@ final class RemoteSwitchNotificationCenter: NSObject, UNUserNotificationCenterDe
         }
     }
 
-    func notifyWarning(title: String, detail: String) {
-        RemoteSwitchHUDController.shared.show(
-            title: title,
-            subtitle: detail,
-            symbol: "exclamationmark.triangle.fill",
-            tint: RemotePalette.amber
-        )
-        NSSound(named: NSSound.Name("Basso"))?.play()
+    func notifyWarning(
+        title: String,
+        detail: String,
+        hudEnabled: Bool = true,
+        soundEnabled: Bool = true
+    ) {
+        if hudEnabled {
+            RemoteSwitchHUDController.shared.show(
+                title: title,
+                subtitle: detail,
+                symbol: "exclamationmark.triangle.fill",
+                tint: RemotePalette.amber
+            )
+        }
+        if soundEnabled {
+            NSSound(named: NSSound.Name("Basso"))?.play()
+        }
     }
 
     private func postSystemBanner(identifier: String, title: String, body: String) {
