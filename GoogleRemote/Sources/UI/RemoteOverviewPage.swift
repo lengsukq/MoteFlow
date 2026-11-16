@@ -29,10 +29,7 @@ struct RemoteOverviewPage: View {
                         symbol: "antenna.radiowaves.left.and.right"
                     )
 
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 12) { channelCards }
-                        VStack(spacing: 10) { channelCards }
-                    }
+                    HStack(spacing: 12) { channelCards }
                 }
             }
 

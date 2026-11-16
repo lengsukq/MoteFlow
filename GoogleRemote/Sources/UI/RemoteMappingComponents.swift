@@ -23,16 +23,10 @@ struct RemoteMappingProfileToolbar: View {
     var body: some View {
         RemoteCard(padding: 13) {
             VStack(alignment: .leading, spacing: 10) {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 10) {
-                        profileSummary
-                        Spacer(minLength: 8)
-                        profileActions
-                    }
-                    VStack(alignment: .leading, spacing: 10) {
-                        profileSummary
-                        profileActions
-                    }
+                HStack(spacing: 10) {
+                    profileSummary
+                    Spacer(minLength: 8)
+                    profileActions
                 }
             }
         }

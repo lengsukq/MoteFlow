@@ -25,17 +25,11 @@ struct RemoteActionLibraryPage: View {
         VStack(alignment: .leading, spacing: 16) {
             starterTemplatesBar
 
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 16) {
-                    libraryListCard
-                        .frame(minWidth: 235, maxWidth: 285)
-                    editorCard
-                        .frame(minWidth: 420, maxWidth: .infinity)
-                }
-                VStack(spacing: 16) {
-                    libraryListCard
-                    editorCard
-                }
+            HStack(alignment: .top, spacing: 16) {
+                libraryListCard
+                    .frame(minWidth: 235, maxWidth: 285)
+                editorCard
+                    .frame(minWidth: 420, maxWidth: .infinity)
             }
         }
         .onAppear {

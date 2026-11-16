@@ -53,7 +53,9 @@ private struct RemoteMenuBarContent: View {
             systemImage: "checkmark.circle.fill"
         )
         Label(
-            hidCapture.isExclusive ? "遥控器按键：已独占就绪" : "遥控器按键：等待连接",
+            hidCapture.isExclusive
+                ? (hidCapture.executeHardwareActions ? "遥控器：已接管生效" : "遥控器：仅预览模式")
+                : (hidCapture.isRemoteControlActive ? "遥控器：等待唤醒连接" : "遥控器：已暂停控制"),
             systemImage: hidCapture.isExclusive ? "checkmark.shield.fill" : "keyboard"
         )
         Label(
@@ -61,7 +63,7 @@ private struct RemoteMenuBarContent: View {
                 ? "当前控制：远端「\(lanRelay.connectedPeerName ?? "另一台 Mac")」"
                 : lanRelay.isControlledByPeer
                     ? "正在接收来自「\(lanRelay.controllingPeerName ?? "主控 Mac")」的操作"
-                    : "当前控制：本机 Mac",
+                    : "当前控制：本机「\(lanRelay.localPeerName)」",
             systemImage: lanRelay.isForwardingToRemoteMac ? "macbook.and.ipad" : "desktopcomputer"
         )
         Label(
@@ -78,49 +80,48 @@ private struct RemoteMenuBarContent: View {
         if lanRelay.isConnected {
             Button(
                 lanRelay.activeTarget == .remoteMac
-                    ? "切回控制本机 Mac (\(lanRelay.switchShortcut.display))"
+                    ? "切回控制「\(lanRelay.localPeerName)」(\(lanRelay.switchShortcut.display))"
                     : "切换控制「\(lanRelay.connectedPeerName ?? "另一台 Mac")」(\(lanRelay.switchShortcut.display))"
             ) {
                 lanRelay.toggleTarget(showHUD: true)
             }
 
-            Menu("远程按键跟随方式") {
-                Button {
-                    lanRelay.setMappingFollowSource(.followRemoteMac)
-                } label: {
-                    if lanRelay.localMappingFollowSource == .followRemoteMac {
-                        Label("跟随远程的遥控器设置", systemImage: "checkmark")
-                    } else {
-                        Text("跟随远程的遥控器设置")
-                    }
-                }
+            Menu("双机键位生效方案（当前：\(lanRelay.activeMappingOwnerName)）") {
+                let peerLabel = lanRelay.connectedPeerName ?? "另一台 Mac"
                 Button {
                     lanRelay.setMappingFollowSource(.followLocalMac)
                 } label: {
                     if lanRelay.localMappingFollowSource == .followLocalMac {
-                        Label("跟随本机的遥控器设置", systemImage: "checkmark")
+                        Label("套用「\(lanRelay.localPeerName)」的键位方案", systemImage: "checkmark")
                     } else {
-                        Text("跟随本机的遥控器设置")
+                        Text("套用「\(lanRelay.localPeerName)」的键位方案")
+                    }
+                }
+                Button {
+                    lanRelay.setMappingFollowSource(.followRemoteMac)
+                } label: {
+                    if lanRelay.localMappingFollowSource == .followRemoteMac {
+                        Label("套用「\(peerLabel)」的键位方案", systemImage: "checkmark")
+                    } else {
+                        Text("套用「\(peerLabel)」的键位方案")
                     }
                 }
             }
         }
 
         if runtime.mainWindowVisible {
-            Button("进入轻量模式（收起到菜单栏）") { runtime.enterLightweightMode() }
+            Button("收起到菜单栏（轻量模式）") { runtime.enterLightweightMode() }
         }
         Divider()
-        Button(hidCapture.executeHardwareActions ? "暂停遥控器动作执行" : "开启遥控器动作执行") {
-            if hidCapture.executeHardwareActions {
+        Button(hidCapture.isRemoteControlActive ? "暂停遥控器控制" : "恢复遥控器控制") {
+            if hidCapture.isRemoteControlActive {
                 actionRunner.endVoiceShortcutHold()
                 bluetooth.stopCurrentVoiceSession()
                 bluetooth.virtualMicrophone.finishVoiceInputWindow()
+                hidCapture.setRemoteControlActive(false)
+            } else {
+                hidCapture.setRemoteControlActive(true)
             }
-            hidCapture.executeHardwareActions.toggle()
-        }
-        Button(hidCapture.autoSeizeEnabled ? "暂停遥控器按键接管" : "恢复遥控器按键接管") {
-            if hidCapture.autoSeizeEnabled { hidCapture.disableAutomaticCapture() }
-            else { hidCapture.enableAutomaticCapture() }
         }
         Button(bluetooth.voiceModeEnabled ? "关闭语音键监听" : "开启语音键监听") {
             bluetooth.toggleVoiceMode()
@@ -128,7 +129,7 @@ private struct RemoteMenuBarContent: View {
         .disabled(!bluetooth.canEnableVoiceMode)
 
         if runtime.lightweightModeEnabled {
-            Button("恢复常规 Dock 窗口模式") {
+            Button("恢复常规程序坞窗口模式") {
                 runtime.lightweightModeEnabled = false
                 runtime.openMainWindow { openWindow(id: "main") }
             }

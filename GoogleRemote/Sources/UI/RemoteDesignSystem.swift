@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 enum RemotePalette {
@@ -35,9 +36,7 @@ extension RemoteBindingKind {
         case .none: "无动作"
         case .keyboardShortcut: "键盘按键"
         case .systemAction: "系统动作"
-        case .libraryAction: "动作库"
-        case .script: "本地脚本"
-        case .voiceInput: "语音输入"
+        case .libraryAction: "动作库 / 脚本"
         }
     }
 
@@ -47,8 +46,6 @@ extension RemoteBindingKind {
         case .keyboardShortcut: "keyboard"
         case .systemAction: "gearshape.2"
         case .libraryAction: "square.stack.3d.up"
-        case .script: "terminal"
-        case .voiceInput: "waveform"
         }
     }
 
@@ -57,9 +54,7 @@ extension RemoteBindingKind {
         case .none: "不触发系统动作"
         case .keyboardShortcut: "单键、组合或修饰键"
         case .systemAction: "调用 macOS 原生功能"
-        case .libraryAction: "使用已保存动作"
-        case .script: "运行已授权脚本"
-        case .voiceInput: "ATVV 专用，待接入"
+        case .libraryAction: "多步动作或本地脚本"
         }
     }
 }
@@ -85,7 +80,7 @@ extension RemoteActionStepKind {
 }
 
 /// One selection language for remote bindings, keyboard keycaps, and action
-/// library steps. Selection is never inferred from colors alone.
+/// library steps. Uses lightweight vector fills with zero offscreen blur passes.
 struct RemoteVisualChoiceStyle: ButtonStyle {
     let selected: Bool
     var radius: CGFloat = 13
@@ -101,8 +96,7 @@ struct RemoteVisualChoiceStyle: ButtonStyle {
                     .strokeBorder(selected ? RemotePalette.indigo.opacity(0.65) :
                                   Color.primary.opacity(0.075), lineWidth: selected ? 1.5 : 1)
             }
-            .scaleEffect(configuration.isPressed ? 0.975 : 1)
-            .animation(.easeOut(duration: 0.15), value: configuration.isPressed)
+            .opacity(configuration.isPressed ? 0.82 : 1)
     }
 }
 
@@ -155,8 +149,7 @@ struct RemoteVisualOption: View {
     }
 }
 
-/// The very same keycap is used in the keyboard editor and the binding/step
-/// previews, including standalone left/right Command and modifier chords.
+/// Shared keycap visual for keyboard editors and binding previews.
 struct RemoteKeyboardKeycap: View {
     let label: String
     var selected = false
@@ -243,45 +236,53 @@ struct RemoteShortcutVisual: View {
     }
 }
 
+/// GPU-friendly static ambient backdrop: replaces live `CIGaussianBlur` (`blur(radius: 90)`)
+/// and `GeometryReader` with a zero-filter `RadialGradient` + `LinearGradient`.
 struct RemoteBackdrop: View {
     var body: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .topTrailing) {
-                Color(nsColor: .windowBackgroundColor)
-                LinearGradient(
-                    colors: [RemotePalette.indigo.opacity(0.075), .clear, RemotePalette.turquoise.opacity(0.035)],
-                    startPoint: .topTrailing,
-                    endPoint: .bottomLeading
-                )
-                Circle()
-                    .fill(RemotePalette.indigo.opacity(0.07))
-                    .frame(width: 340, height: 340)
-                    .blur(radius: 90)
-                    .offset(x: geometry.size.width * 0.08, y: -180)
-            }
+        ZStack {
+            Color(nsColor: .windowBackgroundColor)
+            LinearGradient(
+                colors: [RemotePalette.indigo.opacity(0.065), .clear, RemotePalette.turquoise.opacity(0.03)],
+                startPoint: .topTrailing,
+                endPoint: .bottomLeading
+            )
+            RadialGradient(
+                colors: [RemotePalette.indigo.opacity(0.075), .clear],
+                center: .topTrailing,
+                startRadius: 20,
+                endRadius: 420
+            )
         }
         .ignoresSafeArea()
         .accessibilityHidden(true)
     }
 }
 
+/// 120fps scroll-optimized card container:
+/// - Uses solid adaptive `controlBackgroundColor` instead of per-card `.regularMaterial`
+///   (`CABackdropLayer` live Gaussian backdrop blurs)
+/// - Attaches a subtle analytical shadow directly to the `RoundedRectangle` shape instead of
+///   rasterizing the entire subtree offscreen
+/// - Eliminates container-wide `.onHover` state mutations so scrolling past the stationary
+///   cursor never re-evaluates card subtrees or animates shadows mid-scroll.
 struct RemoteCard<Content: View>: View {
     var padding: CGFloat = 20
     @ViewBuilder var content: Content
-    @State private var isHovered = false
 
     var body: some View {
         content
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(padding)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .background {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+                    .shadow(color: .black.opacity(0.045), radius: 7, x: 0, y: 2)
+            }
             .overlay {
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .strokeBorder(RemotePalette.indigo.opacity(isHovered ? 0.17 : 0.065), lineWidth: 1)
+                    .strokeBorder(Color.primary.opacity(0.075), lineWidth: 1)
             }
-            .shadow(color: .black.opacity(isHovered ? 0.065 : 0.035), radius: isHovered ? 24 : 20, x: 0, y: 9)
-            .onHover { isHovered = $0 }
-            .animation(.easeOut(duration: 0.20), value: isHovered)
     }
 }
 
@@ -341,7 +342,6 @@ struct RemoteMetric: View {
                 Text(value)
                     .font(.system(size: 23, weight: .semibold, design: .rounded))
                     .monospacedDigit()
-                    .contentTransition(.numericText())
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
                 Text(title).font(.system(size: 12)).foregroundStyle(.secondary)
@@ -349,8 +349,8 @@ struct RemoteMetric: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 17, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 17).strokeBorder(.primary.opacity(0.055)))
+        .background(Color.primary.opacity(0.028), in: RoundedRectangle(cornerRadius: 17, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 17, style: .continuous).strokeBorder(.primary.opacity(0.06)))
     }
 }
 
@@ -368,8 +368,6 @@ struct RemoteActionButtonStyle: ButtonStyle {
                     .fill(emphasized ? RemotePalette.indigo : Color.primary.opacity(0.065))
             }
             .opacity(configuration.isPressed ? 0.75 : 1)
-            .scaleEffect(configuration.isPressed ? 0.975 : 1)
-            .animation(.easeOut(duration: 0.14), value: configuration.isPressed)
     }
 }
 
@@ -391,28 +389,31 @@ struct RemoteMicrophoneVisual: View {
                 .scaleEffect(breathing && isActive ? 1.11 : 0.96)
             Circle()
                 .fill(
-                    LinearGradient(colors: [RemotePalette.indigo.opacity(0.22), RemotePalette.turquoise.opacity(0.17)],
+                    LinearGradient(colors: [RemotePalette.indigo.opacity(0.20), RemotePalette.turquoise.opacity(0.15)],
                                    startPoint: .topLeading, endPoint: .bottomTrailing)
                 )
                 .frame(width: 116, height: 116)
-                .blur(radius: isActive ? 8 : 0)
             Circle()
                 .fill(LinearGradient(colors: [RemotePalette.indigo, RemotePalette.turquoise],
                                      startPoint: .topLeading, endPoint: .bottomTrailing))
                 .frame(width: 85, height: 85)
                 .scaleEffect(isActive && !reduceMotion ? 1 + CGFloat(audioLevel) * 0.14 : 1)
-                .shadow(color: RemotePalette.indigo.opacity(0.28), radius: 18, y: 7)
+                .shadow(color: RemotePalette.indigo.opacity(0.24), radius: 10, y: 4)
             Image(systemName: isActive ? "waveform" : "mic.fill")
                 .font(.system(size: 27, weight: .medium))
                 .foregroundStyle(.white)
-                .contentTransition(.symbolEffect(.replace))
         }
         .frame(width: 190, height: 190)
         .accessibilityLabel(isActive ? "正在接收语音" : "语音待机")
-        .onAppear { breathing = !reduceMotion }
-        .onChange(of: reduceMotion) { _, value in breathing = !value }
-        .animation(reduceMotion ? nil : .easeInOut(duration: 2.2).repeatForever(autoreverses: true), value: breathing && isActive)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: audioLevel)
+        .onChange(of: isActive, initial: true) { _, active in
+            if active && !reduceMotion {
+                withAnimation(.easeInOut(duration: 2.0).repeatForever(autoreverses: true)) {
+                    breathing = true
+                }
+            } else {
+                breathing = false
+            }
+        }
     }
 }
 
@@ -424,13 +425,13 @@ struct RemoteWaveform: View {
     var body: some View {
         TimelineView(.animation(minimumInterval: 1 / 20, paused: !active || reduceMotion)) { timeline in
             Canvas { context, size in
-                let time = timeline.date.timeIntervalSinceReferenceDate
+                let time = active ? timeline.date.timeIntervalSinceReferenceDate : 0
                 let count = 40
                 let spacing = size.width / CGFloat(count)
                 for index in 0..<count {
                     let center = abs(Double(index) - Double(count - 1) / 2) / Double(count / 2)
                     let envelope = pow(max(0.08, 1 - center), 0.55)
-                    let ripple = abs(sin(time * 6 + Double(index) * 0.69))
+                    let ripple = active ? abs(sin(time * 6 + Double(index) * 0.69)) : 0
                     let height = active ? max(3, size.height * (0.10 + 0.83 * min(1, level * 2.6) * envelope * (0.3 + 0.7 * ripple))) : 3.5 + 10 * envelope
                     let rect = CGRect(x: CGFloat(index) * spacing + 1, y: (size.height - height) / 2,
                                       width: max(2, spacing - 4), height: height)

@@ -1,14 +1,20 @@
 import AppKit
 import SwiftUI
 
+/// Unified WYSIWYG Remote Workbench:
+/// - Automatically locks & follows the connected physical remote model when hardware is seized
+///   (only exposing manual preview switching when offline so newcomers never trigger mismatch errors)
+/// - Consolidates scripts into the unified Action Library
 struct RemoteMappingPage: View {
     @ObservedObject var store: RemoteBindingStore
     @ObservedObject var library: RemoteLibraryStore
     @ObservedObject var monitor: HIDCaptureManager
     @Binding var selected: RemoteKey
     let onOpenLibrary: () -> Void
+    var onOpenConnection: (() -> Void)? = nil
 
     @EnvironmentObject private var runner: RemoteActionRunner
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var editingGesture: RemoteGesture = .tap
     @State private var recordingGesture: RemoteGesture = .tap
@@ -20,10 +26,22 @@ struct RemoteMappingPage: View {
     @State private var showAllKeysGrid = false
     @State private var showExecutionConfirmation = false
     @State private var manualVoiceHoldActive = false
+    @State private var uiClickFlash: RemoteKey?
+    @State private var uiClickToken = UUID()
+    @State private var presetHint: String?
     @State private var fileError: String?
 
     private var binding: RemoteBinding { store.binding(for: selected) }
     private var action: RemoteAction { store.action(for: selected, gesture: editingGesture) }
+
+    private var hardwareModel: RemoteDeviceModel? {
+        guard let device = monitor.currentDeviceIdentity else { return nil }
+        return RemoteDeviceProfileRegistry.identify(
+            vendorID: device.vendorID,
+            productID: device.productID,
+            productName: device.productName
+        )
+    }
 
     private var conflictKey: RemoteKey? {
         guard let pendingShortcut, let pendingTarget else { return nil }
@@ -48,35 +66,35 @@ struct RemoteMappingPage: View {
     private var bindingOptions: [RemoteBindingKind] {
         var options: [RemoteBindingKind] = [.keyboardShortcut, .libraryAction, .none]
         if selected != .assistant { options.insert(.systemAction, at: 0) }
-        if action.kind == .script { options.append(.script) }
-        if action.kind == .voiceInput { options.append(.voiceInput) }
         return options
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
+            starterScenesAndModelBar
             RemoteMappingProfileToolbar(store: store)
 
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 16) {
-                    leftRemotePreviewCard
-                        .frame(minWidth: 306, maxWidth: 390)
-                    rightConfigurationCard
-                        .frame(minWidth: 370, maxWidth: .infinity)
-                }
-                VStack(spacing: 16) {
-                    leftRemotePreviewCard
-                    rightConfigurationCard
-                }
+            HStack(alignment: .top, spacing: 16) {
+                leftRemotePreviewCard
+                    .frame(minWidth: 306, maxWidth: 380)
+                rightConfigurationCard
+                    .frame(minWidth: 360, maxWidth: .infinity)
             }
 
             allKeysQuickGridCard
         }
         .onAppear {
+            if let hardwareModel, store.activeModel != hardwareModel {
+                store.selectModel(hardwareModel)
+            }
             if selected == .assistant { editingGesture = .longPress }
         }
-        .onChange(of: monitor.activePhysicalKey) { _, key in
-            if let key { selected = key }
+        .onChange(of: monitor.hardwareEventSequence) { _, _ in
+            if let key = monitor.activePhysicalKey ?? monitor.highlightedPhysicalKey {
+                withAnimation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.78)) {
+                    selected = key
+                }
+            }
         }
         .onChange(of: selected) { _, key in
             if key == .assistant { editingGesture = .longPress }
@@ -140,9 +158,7 @@ struct RemoteMappingPage: View {
             Text("快捷键已被「\(conflictKey?.title ?? "其他按键")」的\(pendingGesture.title)使用，是否移到当前按键？")
         }
         .confirmationDialog("立即在本机试运行此动作？", isPresented: $showExecutionConfirmation) {
-            Button("确认试运行") {
-                runCurrentActionTest()
-            }
+            Button("确认试运行") { runCurrentActionTest() }
             Button("取消", role: .cancel) {}
         } message: {
             Text("将真实触发「\(selected.title) · \(editingGesture.title)」所绑定的功能。")
@@ -157,20 +173,122 @@ struct RemoteMappingPage: View {
         }
     }
 
-    // MARK: - Left Interactive Remote Panel
+    // MARK: - Top Starter Scene Presets & Auto-Following Hardware Badge
+
+    private var starterScenesAndModelBar: some View {
+        RemoteCard(padding: 13) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    starterSceneChips
+                    Spacer(minLength: 8)
+                    modelHeaderBadgeOrPicker
+                }
+                if let presetHint {
+                    Text(presetHint)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(RemotePalette.positive)
+                }
+            }
+        }
+    }
+
+    private var starterSceneChips: some View {
+        HStack(spacing: 7) {
+            Label("一键场景预设：", systemImage: "wand.and.stars")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            ForEach(RemoteStarterScenePreset.allCases) { preset in
+                Button {
+                    withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) {
+                        store.applyStarterScene(preset)
+                        presetHint = "已套用「\(preset.title)」：\(preset.subtitle)"
+                    }
+                } label: {
+                    Label(preset.title, systemImage: preset.symbol)
+                        .font(.system(size: 11, weight: .semibold))
+                        .padding(.horizontal, 10)
+                        .frame(height: 30)
+                        .background(RemotePalette.indigo.opacity(0.085), in: RoundedRectangle(cornerRadius: 9))
+                        .foregroundStyle(RemotePalette.indigo)
+                }
+                .buttonStyle(.plain)
+                .help(preset.subtitle)
+            }
+        }
+    }
+
+    private var modelHeaderBadgeOrPicker: some View {
+        HStack(spacing: 8) {
+            Text("已配 \(store.configuredCount)/\(store.activeModel.keys.count) 键")
+                .font(.system(size: 11, design: .rounded))
+                .foregroundStyle(.secondary)
+
+            if let hardwareModel {
+                // Auto-locked to the connected physical remote so newcomers cannot accidentally switch models
+                RemoteStatusPill(
+                    title: hardwareModel.name,
+                    symbol: "appletvremote.gen4",
+                    tint: RemotePalette.positive
+                )
+            } else {
+                // Offline preview mode: allow inspecting built-in remote layouts
+                Menu {
+                    ForEach(RemoteDeviceProfileRegistry.builtIn) { model in
+                        Button {
+                            store.selectModel(model)
+                            if !model.keys.contains(selected) { selected = .select }
+                        } label: {
+                            if store.activeModel == model {
+                                Label(model.name, systemImage: "checkmark")
+                            } else {
+                                Text(model.name)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "appletvremote.gen4")
+                        Text("预览：\(store.activeModel.name)")
+                            .lineLimit(1)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.system(size: 11.5, weight: .medium))
+                    .padding(.horizontal, 10)
+                    .frame(height: 30)
+                    .background(.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 9))
+                }
+                .menuStyle(.borderlessButton)
+            }
+        }
+    }
+
+    // MARK: - Left Interactive Remote Canvas
 
     private var leftRemotePreviewCard: some View {
         RemoteCard {
             VStack(alignment: .center, spacing: 12) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("点击选择要改的按键")
+                        Text("按手中遥控器或点选按键")
                             .font(.system(size: 14, weight: .semibold))
-                        Text("单击选短按 · 长按按钮直接选长按 · 按实体键自动跟随")
+                        Text("按实体键实时波纹跟选 · 改完再按当场测试")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
+                    if let onOpenConnection, !monitor.isExclusive {
+                        Button("连接指引", action: onOpenConnection)
+                            .buttonStyle(RemoteActionButtonStyle())
+                    } else {
+                        RemoteStatusPill(
+                            title: monitor.isExclusive ? "真机已接管" : "预览画布",
+                            symbol: monitor.isExclusive ? "checkmark.circle.fill" : "hand.tap",
+                            tint: monitor.isExclusive ? RemotePalette.positive : RemotePalette.indigo
+                        )
+                    }
                 }
 
                 if monitor.advancedLearningEnabled {
@@ -180,14 +298,15 @@ struct RemoteMappingPage: View {
                 RemoteKeyVisual(
                     selected: $selected,
                     store: store,
-                    feedbackKey: monitor.highlightedPhysicalKey
+                    feedbackKey: monitor.highlightedPhysicalKey ?? uiClickFlash
                 ) { key, gesture in
                     editingGesture = key == .assistant ? .longPress : gesture
+                    flashUIPreview(key)
                 }
                 .frame(maxWidth: .infinity)
 
                 HStack(spacing: 9) {
-                    Image(systemName: monitor.activePhysicalKey != nil ? "checkmark.circle.fill" : "dot.radiowaves.left.and.right")
+                    Image(systemName: monitor.activePhysicalKey != nil ? "bolt.circle.fill" : "dot.radiowaves.left.and.right")
                         .foregroundStyle(monitor.activePhysicalKey != nil ? RemotePalette.positive : RemotePalette.indigo)
                     Text(monitor.lastHardwareFeedback)
                         .font(.system(size: 11))
@@ -198,9 +317,21 @@ struct RemoteMappingPage: View {
                 .padding(10)
                 .background(.primary.opacity(0.028), in: RoundedRectangle(cornerRadius: 11))
 
-                Toggle("允许实体按键立即生效", isOn: $monitor.executeHardwareActions)
+                Toggle("允许实体遥控器立即触发动作", isOn: $monitor.executeHardwareActions)
                     .font(.system(size: 12, weight: .medium))
                     .toggleStyle(.switch)
+            }
+        }
+    }
+
+    private func flashUIPreview(_ key: RemoteKey) {
+        let token = UUID()
+        uiClickToken = token
+        uiClickFlash = key
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            guard uiClickToken == token else { return }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+                uiClickFlash = nil
             }
         }
     }
@@ -273,13 +404,13 @@ struct RemoteMappingPage: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(selected.title)
                     .font(.system(size: 18, weight: .bold, design: .rounded))
-                Text(selected.location)
+                Text("\(selected.location) · 单击和长按可分别绑定不同动作")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
             Spacer()
             RemoteStatusPill(
-                title: binding.isConfigured ? "已设置功能" : "暂未设置",
+                title: binding.isConfigured ? "已配置" : "未设置",
                 symbol: binding.isConfigured ? "checkmark.circle.fill" : "circle.dotted",
                 tint: binding.isConfigured ? RemotePalette.positive : .secondary
             )
@@ -290,7 +421,7 @@ struct RemoteMappingPage: View {
 
     private var gesturePickerSection: some View {
         VStack(alignment: .leading, spacing: 9) {
-            Text("1. 选择触发方式（单击和长按可分别设置不同功能）")
+            Text("1. 选择触发手势")
                 .font(.system(size: 12, weight: .semibold))
             HStack(spacing: 9) {
                 RemoteVisualOption(
@@ -313,7 +444,7 @@ struct RemoteMappingPage: View {
 
             if editingGesture == .longPress {
                 HStack(spacing: 10) {
-                    Text("长按触发时间")
+                    Text("长按判定时长")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.secondary)
                     Slider(value: Binding(
@@ -332,13 +463,13 @@ struct RemoteMappingPage: View {
     private var quickPresetsSection: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack {
-                Text("2. 一键绑定高频功能")
+                Text("2. 一键选用常用动作")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
                 Button {
                     showingMacPresetPicker = true
                 } label: {
-                    Label("浏览全部 22+ 项系统功能", systemImage: "square.grid.2x2")
+                    Label("全部 22+ 项系统功能库", systemImage: "square.grid.2x2")
                 }
                 .buttonStyle(.link)
                 .font(.system(size: 11, weight: .medium))
@@ -355,8 +486,8 @@ struct RemoteMappingPage: View {
                 }
 
                 quickChip(
-                    title: "打开本机 App",
-                    subtitle: "任选应用程序",
+                    title: "打开任意 App",
+                    subtitle: "选择本机应用程序",
                     symbol: "app.badge",
                     active: currentActionIsApp && action.presetID != RemoteLibraryStore.chatGPTPresetID,
                     action: chooseApplicationForKey
@@ -433,7 +564,7 @@ struct RemoteMappingPage: View {
 
     private var assistantDedicatedSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("语音助手专用配置（配合豆包等语音输入工具）")
+            Text("语音助手专用配置（配合豆包等 AI 语音工具）")
                 .font(.system(size: 12, weight: .semibold))
             RemoteVoiceTriggerSelector(trigger: $monitor.doubaoShortcutTrigger)
             Text(monitor.doubaoShortcutTrigger.detail)
@@ -447,7 +578,7 @@ struct RemoteMappingPage: View {
 
     private var actionKindAndDetailSection: some View {
         VStack(alignment: .leading, spacing: 11) {
-            Text(selected == .assistant ? "语音键关联热键或动作" : "3. 或自由定制动作类型")
+            Text(selected == .assistant ? "语音键关联热键或动作" : "3. 或自由定制键盘热键与动作库（含本地脚本）")
                 .font(.system(size: 12, weight: .semibold))
 
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 8)], spacing: 8) {
@@ -473,13 +604,13 @@ struct RemoteMappingPage: View {
         case .keyboardShortcut:
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 10) {
-                    RemoteShortcutVisual(shortcut: action.shortcut, placeholder: "尚未设置按键")
+                    RemoteShortcutVisual(shortcut: action.shortcut, placeholder: "尚未录制快捷键")
                     Spacer()
                     Button {
                         recordingGesture = editingGesture
                         showingRecorder = true
                     } label: {
-                        Label(action.shortcut == nil ? "设置快捷键" : "修改快捷键", systemImage: "keyboard")
+                        Label(action.shortcut == nil ? "录制快捷键" : "修改快捷键", systemImage: "keyboard")
                     }
                     .buttonStyle(RemoteActionButtonStyle(emphasized: true))
                 }
@@ -531,14 +662,16 @@ struct RemoteMappingPage: View {
         case .libraryAction:
             VStack(alignment: .leading, spacing: 9) {
                 HStack {
-                    Text("选择动作库中的多步动作")
+                    Text("选择已保存的动作或脚本（支持多步组合）")
                         .font(.system(size: 12, weight: .semibold))
                     Spacer()
-                    Button("前往动作库新建/编辑") {
+                    Button {
                         onOpenLibrary()
+                    } label: {
+                        Label("新建 / 编辑动作与脚本", systemImage: "plus.square.on.square")
                     }
                     .buttonStyle(.link)
-                    .font(.system(size: 11))
+                    .font(.system(size: 11, weight: .semibold))
                 }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 155), spacing: 8)], spacing: 8) {
                     ForEach(library.actions) { saved in
@@ -557,23 +690,7 @@ struct RemoteMappingPage: View {
             .padding(12)
             .background(RemotePalette.indigo.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
 
-        case .script:
-            HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(action.scriptPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "尚未选择脚本")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text("支持 .sh / .zsh / .command / .py")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("选择脚本文件", action: chooseScript)
-                    .buttonStyle(RemoteActionButtonStyle(emphasized: true))
-            }
-            .padding(12)
-            .background(RemotePalette.indigo.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
-
-        case .none, .voiceInput:
+        case .none:
             EmptyView()
         }
     }
@@ -597,7 +714,7 @@ struct RemoteMappingPage: View {
                 .frame(width: 210)
             }
             Text(action.effectiveHoldMode == .physical
-                 ? "按住遥控器时持续按住目标键（方向键、删除键会自动连续滚动/连删），松开即停。"
+                 ? "按住遥控器时持续连发目标键（方向键连续滚动、退格键连续删除），松开即停。"
                  : "松开遥控器后，按设定的固定时长发送一次按键。")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
@@ -622,7 +739,7 @@ struct RemoteMappingPage: View {
                 Button {
                     showExecutionConfirmation = true
                 } label: {
-                    Label("试运行当前动作", systemImage: "play.fill")
+                    Label("模拟试运行此动作", systemImage: "play.fill")
                 }
                 .buttonStyle(RemoteActionButtonStyle(emphasized: true))
                 .disabled(!canTestCurrentAction || runner.running)
@@ -646,11 +763,10 @@ struct RemoteMappingPage: View {
 
     private var canTestCurrentAction: Bool {
         switch action.kind {
-        case .none, .voiceInput: return false
+        case .none: return false
         case .keyboardShortcut: return action.shortcut != nil
         case .systemAction: return action.systemAction != nil
-        case .script: return action.scriptPath != nil
-        case .libraryAction: return library.action(action.presetID) != nil
+        case .libraryAction: return library.steps(for: action) != nil
         }
     }
 
@@ -691,7 +807,7 @@ struct RemoteMappingPage: View {
                 .padding(.top, 10)
             } label: {
                 HStack {
-                    Label("展开全部按键总览表", systemImage: "square.grid.3x3")
+                    Label("展开全部按键配置总览表", systemImage: "square.grid.3x3")
                         .font(.system(size: 12, weight: .semibold))
                     Spacer()
                     Text("已配置 \(store.configuredCount)/\(store.activeModel.keys.count) 个按键")
@@ -746,23 +862,6 @@ struct RemoteMappingPage: View {
     private func clearPendingConflict() {
         pendingShortcut = nil
         pendingTarget = nil
-    }
-
-    private func chooseScript() {
-        let key = selected
-        let gesture = editingGesture
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "绑定到\(key.title)"
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
-            guard ["sh", "zsh", "command", "py"].contains(url.pathExtension.lowercased()) else {
-                fileError = "请选择 .sh、.zsh、.command 或 .py 脚本文件。"
-                return
-            }
-            store.setScript(url.path, for: key, gesture: gesture)
-        }
     }
 
     private func chooseApplicationForKey() {

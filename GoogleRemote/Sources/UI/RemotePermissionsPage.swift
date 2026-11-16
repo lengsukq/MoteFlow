@@ -5,7 +5,6 @@ import CoreBluetooth
 import CoreGraphics
 import Speech
 import SwiftUI
-import UserNotifications
 
 enum RemotePermissionFilter: String, CaseIterable, Identifiable {
     case all = "全部权限"
@@ -17,7 +16,7 @@ enum RemotePermissionFilter: String, CaseIterable, Identifiable {
 
 enum RemotePermissionTier: String {
     case core = "基础核心权限（必选）"
-    case optional = "双机与语音进阶权限（按需）"
+    case optional = "双机与语音扩展能力（按需）"
 }
 
 enum RemotePermissionGrantState: Equatable {
@@ -60,7 +59,6 @@ enum RemotePermissionKind: String, CaseIterable, Identifiable {
     case accessibility
     case bluetooth
     case localNetwork
-    case notifications
     case speechRecognition
     case virtualAudio
 
@@ -70,7 +68,7 @@ enum RemotePermissionKind: String, CaseIterable, Identifiable {
         switch self {
         case .inputMonitoring, .accessibility, .bluetooth:
             .core
-        case .localNetwork, .notifications, .speechRecognition, .virtualAudio:
+        case .localNetwork, .speechRecognition, .virtualAudio:
             .optional
         }
     }
@@ -81,7 +79,6 @@ enum RemotePermissionKind: String, CaseIterable, Identifiable {
         case .accessibility: "辅助功能（Accessibility）"
         case .bluetooth: "蓝牙连接（Bluetooth）"
         case .localNetwork: "本地网络（双机互联）"
-        case .notifications: "系统通知（切换提醒）"
         case .speechRecognition: "本地语音识别（离线转文字）"
         case .virtualAudio: "虚拟麦克风驱动（BlackHole 2ch）"
         }
@@ -93,7 +90,6 @@ enum RemotePermissionKind: String, CaseIterable, Identifiable {
         case .accessibility: "keyboard.badge.ellipsis"
         case .bluetooth: "dot.radiowaves.left.and.right"
         case .localNetwork: "macbook.and.ipad"
-        case .notifications: "bell.badge.fill"
         case .speechRecognition: "waveform.badge.mic"
         case .virtualAudio: "speaker.wave.2.bubble"
         }
@@ -109,8 +105,6 @@ enum RemotePermissionKind: String, CaseIterable, Identifiable {
             "扫描并连接蓝牙遥控器、建立 ATVV 语音控制通道。"
         case .localNetwork:
             "在同一局域网（同端口）自动发现另一台 Mac，支持已配对设备自动静默重连与远程按键转发。"
-        case .notifications:
-            "按快捷键切换回本机或收到配对请求时，在屏幕右上角弹出系统通知横幅与提示音。"
         case .speechRecognition:
             "不经过网络，直接调用 macOS 本地引擎将遥控器语音录音转写为文字。"
         case .virtualAudio:
@@ -129,12 +123,11 @@ struct RemotePermissionStatusSnapshot: Identifiable, Equatable {
     var id: RemotePermissionKind { kind }
 }
 
-/// Centralized real-time permission inspector so users can view all granted and
-/// missing macOS permissions in a single place without hunting across pages.
+/// Centralized real-time permission inspector (3 Core + 3 Optional; zero unnecessary
+/// Notification TCC prompts thanks to the built-in top HUD capsule).
 @MainActor
 final class RemotePermissionCenter: ObservableObject {
     @Published private(set) var snapshots: [RemotePermissionStatusSnapshot] = []
-    @Published private(set) var notificationAuthStatus: UNAuthorizationStatus = .notDetermined
     @Published private(set) var lastRefreshedAt = Date()
 
     private var pollTask: Task<Void, Never>?
@@ -165,7 +158,6 @@ final class RemotePermissionCenter: ObservableObject {
     ) {
         bluetooth.virtualMicrophone.refreshDevices()
         rebuildSnapshots(bluetooth: bluetooth, lanRelay: lanRelay)
-        refreshNotificationAuthorization(bluetooth: bluetooth, lanRelay: lanRelay)
     }
 
     func startLiveMonitoring(
@@ -180,7 +172,6 @@ final class RemotePermissionCenter: ObservableObject {
                 guard !Task.isCancelled,
                       let self, let bluetooth, let lanRelay else { return }
                 self.rebuildSnapshots(bluetooth: bluetooth, lanRelay: lanRelay)
-                self.refreshNotificationAuthorization(bluetooth: bluetooth, lanRelay: lanRelay)
             }
         }
     }
@@ -188,27 +179,6 @@ final class RemotePermissionCenter: ObservableObject {
     func stopLiveMonitoring() {
         pollTask?.cancel()
         pollTask = nil
-    }
-
-    private func refreshNotificationAuthorization(
-        bluetooth: RemoteBluetoothManager,
-        lanRelay: RemoteLANRelayManager
-    ) {
-        guard Bundle.main.bundleIdentifier != nil,
-              Bundle.main.bundleURL.pathExtension.lowercased() == "app" else {
-            notificationAuthStatus = .notDetermined
-            rebuildSnapshots(bluetooth: bluetooth, lanRelay: lanRelay)
-            return
-        }
-        UNUserNotificationCenter.current().getNotificationSettings { [weak self, weak bluetooth, weak lanRelay] settings in
-            Task { @MainActor in
-                guard let self else { return }
-                self.notificationAuthStatus = settings.authorizationStatus
-                if let bluetooth, let lanRelay {
-                    self.rebuildSnapshots(bluetooth: bluetooth, lanRelay: lanRelay)
-                }
-            }
-        }
     }
 
     private func rebuildSnapshots(
@@ -242,8 +212,8 @@ final class RemotePermissionCenter: ObservableObject {
             kind: .accessibility,
             state: axTrusted ? .granted : .denied,
             statusDetail: axTrusted
-                ? "已授权 · 键盘快捷键模拟、长按连发与跨应用菜单均可用（如刚勾选后仍无效，请点上方「重启 MoteFlow」）"
-                : "尚未添加权限 · 点击「弹出授权提示」并在系统设置「辅助功能」中打开 MoteFlow 开关（勾选后可能需要重启应用生效）",
+                ? "已授权 · 键盘快捷键模拟、长按连发与跨应用菜单均可用"
+                : "尚未添加权限 · 点击「弹出授权提示」并在系统设置「辅助功能」中打开 MoteFlow 开关",
             primaryActionTitle: axTrusted ? nil : "弹出授权提示",
             settingsActionTitle: "打开辅助功能设置"
         ))
@@ -311,37 +281,7 @@ final class RemotePermissionCenter: ObservableObject {
             settingsActionTitle: "打开本地网络设置"
         ))
 
-        // 5. System Notifications
-        let notifyState: RemotePermissionGrantState
-        let notifyDetail: String
-        let notifyPrimary: String?
-        switch notificationAuthStatus {
-        case .authorized, .provisional, .ephemeral:
-            notifyState = .granted
-            notifyDetail = "已授权 · 切换到本机或远端 Mac 时会弹出横幅通知与声音提醒"
-            notifyPrimary = "发送预览通知"
-        case .notDetermined:
-            notifyState = .notDetermined
-            notifyDetail = "尚未请求系统通知权限 · 开启后切换回本机时右上角会有明确通知提示"
-            notifyPrimary = "申请通知权限"
-        case .denied:
-            notifyState = .denied
-            notifyDetail = "系统通知已被关闭（仍保留屏幕顶部悬浮提示条）· 可到系统通知设置中重新允许"
-            notifyPrimary = nil
-        @unknown default:
-            notifyState = .notDetermined
-            notifyDetail = "等待检测通知权限"
-            notifyPrimary = "申请通知权限"
-        }
-        list.append(RemotePermissionStatusSnapshot(
-            kind: .notifications,
-            state: notifyState,
-            statusDetail: notifyDetail,
-            primaryActionTitle: notifyPrimary,
-            settingsActionTitle: "打开系统通知设置"
-        ))
-
-        // 6. Speech Recognition
+        // 5. Speech Recognition
         let speechAuth = SFSpeechRecognizer.authorizationStatus()
         let speechState: RemotePermissionGrantState
         let speechDetail: String
@@ -372,7 +312,7 @@ final class RemotePermissionCenter: ObservableObject {
             settingsActionTitle: "打开语音识别设置"
         ))
 
-        // 7. Virtual Audio Driver (BlackHole 2ch)
+        // 6. Virtual Audio Driver (BlackHole 2ch)
         let hasBlackHole = bluetooth.virtualMicrophone.devices.contains {
             $0.name.localizedCaseInsensitiveContains("BlackHole 2ch")
         }
@@ -386,6 +326,7 @@ final class RemotePermissionCenter: ObservableObject {
             settingsActionTitle: "打开声音设置"
         ))
 
+        guard snapshots != list else { return }
         snapshots = list
         lastRefreshedAt = Date()
     }
@@ -425,17 +366,6 @@ final class RemotePermissionCenter: ObservableObject {
             }
             refresh(bluetooth: bluetooth, lanRelay: lanRelay)
 
-        case .notifications:
-            if notificationAuthStatus == .authorized || notificationAuthStatus == .provisional {
-                lanRelay.previewLocalSwitchNotification()
-            } else {
-                RemoteSwitchNotificationCenter.shared.requestAuthorizationIfNeeded()
-                Task { @MainActor in
-                    try? await Task.sleep(for: .milliseconds(700))
-                    self.refresh(bluetooth: bluetooth, lanRelay: lanRelay)
-                }
-            }
-
         case .speechRecognition:
             SFSpeechRecognizer.requestAuthorization { [weak self, weak bluetooth, weak lanRelay] _ in
                 Task { @MainActor in
@@ -464,8 +394,6 @@ final class RemotePermissionCenter: ObservableObject {
             }
         case .localNetwork:
             urlString = "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork"
-        case .notifications:
-            urlString = "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
         case .speechRecognition:
             urlString = "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition"
         case .virtualAudio:
@@ -483,8 +411,6 @@ final class RemotePermissionCenter: ObservableObject {
     func relaunchApplication() {
         let appURL = Bundle.main.bundleURL
         guard appURL.pathExtension.lowercased() == "app" else { return }
-        // Spawn a short delayed open and terminate first so the current instance
-        // cleanly releases port 49280, HID exclusive handles, and audio queues.
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/sh")
         task.arguments = ["-c", "sleep 0.45 && /usr/bin/open -n \"$1\"", "_", appURL.path]
@@ -524,12 +450,9 @@ struct RemotePermissionsPage: View {
 
     private func applyFilter(_ items: [RemotePermissionStatusSnapshot]) -> [RemotePermissionStatusSnapshot] {
         switch filter {
-        case .all:
-            items
-        case .missing:
-            items.filter { !$0.state.isGranted }
-        case .granted:
-            items.filter { $0.state.isGranted }
+        case .all: items
+        case .missing: items.filter { !$0.state.isGranted }
+        case .granted: items.filter { $0.state.isGranted }
         }
     }
 
@@ -552,7 +475,7 @@ struct RemotePermissionsPage: View {
                 if !filteredOptional.isEmpty {
                     permissionSectionCard(
                         title: RemotePermissionTier.optional.rawValue,
-                        subtitle: "用于两台 Mac 局域网自动重连、切换通知横幅与语音输入的扩展能力",
+                        subtitle: "用于两台 Mac 局域网自动重连与语音输入的按需扩展能力",
                         symbol: "sparkles.rectangle.stack",
                         items: filteredOptional
                     )
@@ -627,18 +550,9 @@ struct RemotePermissionsPage: View {
                 }
 
                 HStack(spacing: 8) {
-                    filterTabButton(
-                        .all,
-                        count: permissionCenter.snapshots.count
-                    )
-                    filterTabButton(
-                        .missing,
-                        count: permissionCenter.missingTotalCount
-                    )
-                    filterTabButton(
-                        .granted,
-                        count: permissionCenter.grantedTotalCount
-                    )
+                    filterTabButton(.all, count: permissionCenter.snapshots.count)
+                    filterTabButton(.missing, count: permissionCenter.missingTotalCount)
+                    filterTabButton(.granted, count: permissionCenter.grantedTotalCount)
                     Spacer()
 
                     if permissionCenter.missingCoreCount == 0 {
@@ -800,7 +714,7 @@ struct RemotePermissionsPage: View {
                         .font(.system(size: 13, weight: .semibold))
                 }
 
-                Text("• **另一台被远程控制的 Mac 需要开哪些权限？** 若遥控器蓝牙只连在主控 Mac 上，另一台受控 Mac 只需开启「辅助功能」和「本地网络」（加「系统通知」看提醒），无需配对蓝牙或开启输入监控。\n• **如果在系统设置里已经勾选了 MoteFlow 但仍提示未开启**：覆盖升级应用后旧记录可能失效，可在系统权限列表选中 MoteFlow 点底部「-」移除，再点击下方「在 Finder 定位当前应用」把图标拖进去并点「重启应用刷新」。")
+                Text("• **另一台被远程控制的 Mac 需要开哪些权限？** 若遥控器蓝牙只连在主控 Mac 上，另一台受控 Mac 只需开启「辅助功能」和「本地网络」，无需配对蓝牙或开启输入监控。\n• **如果在系统设置里已经勾选了 MoteFlow 但仍提示未开启**：覆盖升级应用后旧记录可能失效，可在系统权限列表选中 MoteFlow 点底部「-」移除，再点击下方「在 Finder 定位当前应用」把图标拖进去并点「重启 MoteFlow」。")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

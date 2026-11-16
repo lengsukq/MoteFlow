@@ -3,10 +3,8 @@ import SwiftUI
 private struct RemotePhysicalButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.91 : 1)
-            .animation(.spring(response: 0.22, dampingFraction: 0.62), value: configuration.isPressed)
+            .scaleEffect(configuration.isPressed ? 0.93 : 1)
     }
-
 }
 
 private struct RemoteButtonFace: View {
@@ -19,7 +17,6 @@ private struct RemoteButtonFace: View {
     let longPressThreshold: Double
     var darkAppearance = false
     let onSelect: (RemoteKey, RemoteGesture) -> Void
-    @State private var hovered = false
     @State private var didLongPress = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -29,7 +26,7 @@ private struct RemoteButtonFace: View {
         if selected { return RemotePalette.indigo }
         if isAssistant { return Color(nsColor: .labelColor).opacity(0.92) }
         if darkAppearance { return Color.white.opacity(0.16) }
-        return Color(nsColor: .controlBackgroundColor)
+        return Color(nsColor: .windowBackgroundColor)
     }
 
     var body: some View {
@@ -43,9 +40,13 @@ private struct RemoteButtonFace: View {
             ZStack(alignment: .topTrailing) {
                 RoundedRectangle(cornerRadius: min(width, height) * 0.48, style: .continuous)
                     .fill(fill)
-                    .shadow(color: feedbackActive ? RemotePalette.positive.opacity(0.44) :
-                            selected ? RemotePalette.indigo.opacity(0.32) : Color.black.opacity(0.10),
-                            radius: feedbackActive ? 18 : selected ? 10 : 5, x: 0, y: 3)
+                    .shadow(
+                        color: feedbackActive ? RemotePalette.positive.opacity(0.35) :
+                            selected ? RemotePalette.indigo.opacity(0.24) : Color.black.opacity(0.06),
+                        radius: feedbackActive ? 8 : selected ? 5 : 2,
+                        x: 0,
+                        y: 2
+                    )
 
                 label
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -60,20 +61,20 @@ private struct RemoteButtonFace: View {
             }
             .frame(width: width, height: height)
             .overlay {
-                RoundedRectangle(cornerRadius: min(width, height) * 0.48)
-                    .strokeBorder(feedbackActive ? RemotePalette.positive :
-                        selected ? RemotePalette.indigo.opacity(0.70) :
-                        (darkAppearance ? Color.white.opacity(hovered ? 0.35 : 0.12) :
-                            Color.primary.opacity(hovered ? 0.19 : 0.08)), lineWidth: selected ? 1.5 : 0.7)
+                RoundedRectangle(cornerRadius: min(width, height) * 0.48, style: .continuous)
+                    .strokeBorder(
+                        feedbackActive ? RemotePalette.positive :
+                            selected ? RemotePalette.indigo.opacity(0.75) :
+                            (darkAppearance ? Color.white.opacity(0.14) : Color.primary.opacity(0.10)),
+                        lineWidth: selected || feedbackActive ? 1.6 : 0.8
+                    )
             }
-            .scaleEffect(hovered && !reduceMotion ? 1.065 : 1)
-            .animation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.72), value: hovered)
+            .scaleEffect(feedbackActive && !reduceMotion ? 1.08 : 1)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: feedbackActive)
         }
         .buttonStyle(RemotePhysicalButtonStyle())
         .onLongPressGesture(minimumDuration: longPressThreshold, pressing: { pressed in
             if !pressed, didLongPress {
-                // If the system does not deliver the Button action after a
-                // long press, clear the guard before the next independent tap.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
                     didLongPress = false
                 }
@@ -82,7 +83,6 @@ private struct RemoteButtonFace: View {
             didLongPress = true
             onSelect(key, .longPress)
         })
-        .onHover { hovered = $0 }
         .help("\(key.title) · 点击配置单击，长按配置长按")
         .accessibilityLabel("\(key.title)，\(configured ? "已配置" : "未配置")")
     }
@@ -109,14 +109,13 @@ private struct RemoteButtonFace: View {
     }
 }
 
-/// A vector-drawn, individually clickable representation of the original
-/// Chromecast Voice Remote. No image hotspots, fixed screenshots, or web UI.
+/// Vector-drawn clickable representation of the remote, optimized for zero
+/// mid-scroll hover invalidation and lightweight analytical shape shadows.
 struct RemoteKeyVisual: View {
     @Binding var selected: RemoteKey
     @ObservedObject var store: RemoteBindingStore
     var feedbackKey: RemoteKey?
     var onInteraction: ((RemoteKey, RemoteGesture) -> Void)?
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(spacing: 14) {
@@ -171,15 +170,13 @@ struct RemoteKeyVisual: View {
                 keyFace(.volumeDown, width: 36, height: 43)
             }
             .padding(3)
-            .background(Color(nsColor: .windowBackgroundColor), in: Capsule())
+            .background(Color(nsColor: .controlBackgroundColor), in: Capsule())
             .overlay(Capsule().strokeBorder(.primary.opacity(0.13)))
             .offset(x: 113, y: -58)
         }
         .frame(width: 290, height: 520)
     }
 
-    /// Interactive SwiftUI illustration for Xiaomi 2 / 2 Pro. It is deliberately
-    /// a semantic schematic, not an assertion that unverified HID codes work.
     private var xiaomiRemote: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 45, style: .continuous)
@@ -188,12 +185,12 @@ struct RemoteKeyVisual: View {
                              Color(red: 0.095, green: 0.11, blue: 0.15)],
                     startPoint: .topLeading, endPoint: .bottomTrailing
                 ))
+                .shadow(color: .black.opacity(0.14), radius: 10, x: 0, y: 5)
                 .frame(width: 206, height: 496)
                 .overlay {
-                    RoundedRectangle(cornerRadius: 45)
+                    RoundedRectangle(cornerRadius: 45, style: .continuous)
                         .strokeBorder(Color.white.opacity(0.22), lineWidth: 1)
                 }
-                .shadow(color: .black.opacity(0.19), radius: 22, x: 0, y: 13)
 
             VStack(spacing: 19) {
                 HStack(spacing: 62) {
@@ -253,47 +250,40 @@ struct RemoteKeyVisual: View {
             longPressThreshold: store.binding(for: key).effectiveThreshold,
             darkAppearance: true,
             onSelect: { item, gesture in
-                withAnimation(reduceMotion ? nil : .spring(response: 0.29, dampingFraction: 0.8)) {
-                    selected = item
-                }
+                selected = item
                 onInteraction?(item, gesture)
             }
         )
     }
+
     private var shell: some View {
         RoundedRectangle(cornerRadius: 80, style: .continuous)
             .fill(
                 LinearGradient(
-                    colors: [Color(nsColor: .controlBackgroundColor),
-                             Color(nsColor: .windowBackgroundColor),
-                             Color(nsColor: .controlBackgroundColor).opacity(0.96)],
+                    colors: [Color(nsColor: .windowBackgroundColor),
+                             Color(nsColor: .controlBackgroundColor)],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
             )
+            .shadow(color: .black.opacity(0.09), radius: 10, x: 0, y: 5)
             .frame(width: 223, height: 508)
             .overlay {
                 RoundedRectangle(cornerRadius: 80, style: .continuous)
-                    .strokeBorder(.primary.opacity(0.14), lineWidth: 1)
+                    .strokeBorder(.primary.opacity(0.13), lineWidth: 1)
             }
-            .overlay {
-                RoundedRectangle(cornerRadius: 75, style: .continuous)
-                    .strokeBorder(.white.opacity(0.13), lineWidth: 5)
-                    .padding(4)
-            }
-            .shadow(color: .black.opacity(0.13), radius: 24, x: 0, y: 17)
             .accessibilityHidden(true)
     }
 
     private var dpad: some View {
         ZStack {
             Circle()
-                .fill(Color(nsColor: .controlBackgroundColor))
+                .fill(Color(nsColor: .windowBackgroundColor))
+                .shadow(color: .black.opacity(0.05), radius: 4, y: 2)
                 .frame(width: 164, height: 164)
                 .overlay {
                     Circle().strokeBorder(.primary.opacity(0.10), lineWidth: 1)
                 }
-                .shadow(color: .black.opacity(0.08), radius: 8, y: 4)
 
             Circle()
                 .strokeBorder(.primary.opacity(0.045), lineWidth: 1)
@@ -319,9 +309,7 @@ struct RemoteKeyVisual: View {
             feedbackActive: feedbackKey == key,
             longPressThreshold: store.binding(for: key).effectiveThreshold,
             onSelect: { item, gesture in
-                withAnimation(reduceMotion ? nil : .spring(response: 0.29, dampingFraction: 0.80)) {
-                    selected = item
-                }
+                selected = item
                 onInteraction?(item, gesture)
             }
         )
