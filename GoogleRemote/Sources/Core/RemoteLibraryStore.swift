@@ -21,7 +21,7 @@ enum RemoteScriptLanguage: String, CaseIterable, Codable, Identifiable {
     var fileExtension: String { self == .python ? "py" : rawValue }
 }
 
-/// Both scripts and keyboard shortcuts are just steps inside an action.
+/// Both scripts and keyboard shortcuts are unified steps inside a library action.
 enum RemoteActionStepKind: String, Codable, CaseIterable, Identifiable {
     case keyboard
     case script
@@ -36,7 +36,6 @@ enum RemoteActionStepKind: String, Codable, CaseIterable, Identifiable {
         case .openApp: "打开应用"
         }
     }
-
 }
 
 struct RemoteActionStep: Identifiable, Codable, Equatable {
@@ -56,10 +55,13 @@ struct RemoteActionStep: Identifiable, Codable, Equatable {
         switch kind {
         case .keyboard:
             return "\(shortcut?.display ?? "未设置按键") · 按住 \(String(format: "%.2f", holdSeconds)) 秒"
-        case .script: return scriptPath.map { URL(fileURLWithPath: $0).lastPathComponent } ??
-            "\(scriptLanguage.title) 脚本"
-        case .wait: return "等待 \(String(format: "%.2f", waitSeconds)) 秒"
-        case .openApp: return "打开 \(applicationName ?? applicationBundleID ?? "尚未选择应用")"
+        case .script:
+            return scriptPath.map { URL(fileURLWithPath: $0).lastPathComponent } ??
+                "\(scriptLanguage.title) 脚本"
+        case .wait:
+            return "等待 \(String(format: "%.2f", waitSeconds)) 秒"
+        case .openApp:
+            return "打开 \(applicationName ?? applicationBundleID ?? "尚未选择应用")"
         }
     }
 }
@@ -81,7 +83,7 @@ private struct RemoteUnifiedLibraryFile: Codable {
     var actions: [RemoteLibraryAction] = []
 }
 
-// Migration only: the previous implementation briefly used two separate arrays.
+// Migration only: v1 library used two separate arrays.
 private struct LegacyScript: Codable {
     var id: UUID
     var name: String
@@ -101,8 +103,8 @@ private struct LegacyLibrary: Codable {
     var presets: [LegacyPreset]
 }
 
-/// One persistent action library: a saved action may be one key, one script,
-/// or a sequence of keys/scripts/delays. Mappings reference IDs, not copies.
+/// Unified persistent action library: keyboard sequences, app launches, delays,
+/// and local scripts are all managed in one place. Mappings reference IDs.
 @MainActor
 final class RemoteLibraryStore: ObservableObject {
     static let chatGPTPresetID = UUID(uuidString: "9EB1438B-CA34-4AF7-82AF-2D9CE44AD8BC")!
@@ -122,6 +124,22 @@ final class RemoteLibraryStore: ObservableObject {
     func action(_ id: UUID?) -> RemoteLibraryAction? {
         guard let id else { return nil }
         return actions.first { $0.id == id }
+    }
+
+    /// Ensures a single-step script action exists for a migrated external script path,
+    /// reusing an existing entry if already imported.
+    func findOrCreateMigratedScriptAction(scriptPath: String) -> UUID? {
+        if let existing = actions.first(where: {
+            $0.steps.count == 1 && $0.steps[0].kind == .script && $0.steps[0].scriptPath == scriptPath
+        }) {
+            return existing.id
+        }
+        let fileName = URL(fileURLWithPath: scriptPath).lastPathComponent
+        let item = RemoteLibraryAction(
+            name: "脚本 · \(fileName.isEmpty ? "本地脚本" : fileName)",
+            steps: [RemoteActionStep(kind: .script, scriptPath: scriptPath)]
+        )
+        return save(item) ? item.id : nil
     }
 
     @discardableResult
@@ -176,9 +194,6 @@ final class RemoteLibraryStore: ObservableObject {
         }
     }
 
-    /// Applies incoming library actions from a connected Mac using either
-    /// `.merge` (only add missing IDs) or `.overwrite` (update existing safe items and add new ones,
-    /// while preserving any purely local script actions).
     @discardableResult
     func applySyncedActions(_ incoming: [RemoteLibraryAction], strategy: RemoteConfigSyncStrategy) -> Int {
         var appliedCount = 0
@@ -207,7 +222,6 @@ final class RemoteLibraryStore: ObservableObject {
 
             if let existingIdx = actions.firstIndex(where: { $0.id == sanitizedItem.id }) {
                 if strategy == .overwrite {
-                    // Never clobber a local action that contains local scripts.
                     let existingHasScript = actions[existingIdx].steps.contains { $0.kind == .script }
                     if !existingHasScript && actions[existingIdx] != sanitizedItem {
                         actions[existingIdx] = sanitizedItem
@@ -227,7 +241,13 @@ final class RemoteLibraryStore: ObservableObject {
 
     func description(for action: RemoteAction) -> String {
         if action.kind == .libraryAction {
-            return self.action(action.presetID)?.name ?? "动作已删除，请重新选择"
+            if let item = self.action(action.presetID) {
+                return item.name
+            }
+            if let path = action.migratedScriptPath {
+                return URL(fileURLWithPath: path).lastPathComponent
+            }
+            return "动作已删除，请重新选择"
         }
         return action.summary
     }
@@ -235,18 +255,20 @@ final class RemoteLibraryStore: ObservableObject {
     /// Missing references must fail closed. No recursive references allowed.
     func steps(for remoteAction: RemoteAction) -> [RemoteActionStep]? {
         switch remoteAction.kind {
-        case .none, .voiceInput, .systemAction: return nil
-        case .libraryAction: return action(remoteAction.presetID)?.steps
+        case .none, .systemAction:
+            return nil
+        case .libraryAction:
+            if let steps = action(remoteAction.presetID)?.steps {
+                return steps
+            }
+            if let path = remoteAction.migratedScriptPath {
+                return [RemoteActionStep(kind: .script, scriptPath: path)]
+            }
+            return nil
         case .keyboardShortcut:
             guard let shortcut = remoteAction.shortcut else { return nil }
             return [RemoteActionStep(kind: .keyboard, shortcut: shortcut,
                                      holdSeconds: remoteAction.effectiveHoldSeconds)]
-        case .script:
-            if let path = remoteAction.scriptPath {
-                return [RemoteActionStep(kind: .script, scriptPath: path)]
-            }
-            // Backwards compatibility for previous library script-only refs.
-            return action(remoteAction.scriptID)?.steps
         }
     }
 
@@ -284,8 +306,9 @@ final class RemoteLibraryStore: ObservableObject {
 
     private func stepsForLegacy(_ action: RemoteAction,
                                 scripts: [RemoteLibraryAction]) -> [RemoteActionStep]? {
-        if action.kind == .script, let scriptID = action.scriptID {
-            return scripts.first(where: { $0.id == scriptID })?.steps
+        if action.kind == .libraryAction, let id = action.presetID,
+           let scriptItem = scripts.first(where: { $0.id == id }) {
+            return scriptItem.steps
         }
         return steps(for: action)
     }

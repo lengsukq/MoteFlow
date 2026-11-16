@@ -86,7 +86,7 @@ enum RemoteSystemAction: String, Codable, CaseIterable, Identifiable {
         case .undo: ["Undo", "撤销"]
         case .redo: ["Redo", "重做", "恢复"]
         default: []
-        }
+    }
     }
 
     /// The system screenshot tool supports these flags without shortcut remaps.
@@ -164,7 +164,7 @@ struct MacShortcutPreset: Identifiable, Hashable {
                                _ keyCode: UInt16, _ label: String,
                                command: Bool = false, shift: Bool = false,
                                option: Bool = false, control: Bool = false) -> Self {
-        .init(id: id, title: title, detail: detail, symbol: symbol, category: category,
+        .init(id: id, title: title, detail: detail, symbol: String(symbol), category: category,
               shortcut: RemoteShortcut(keyCode: keyCode, keyLabel: label,
                                        command: command, shift: shift,
                                        option: option, control: control))
@@ -252,8 +252,8 @@ enum RemoteKeyRepeatPolicy {
     }
 }
 
-/// The physical button inventory of the original Chromecast Voice Remote (G9N9N).
-/// Buttons are kept distinct from HID usages, which still require hardware verification.
+/// The physical button inventory of the original Chromecast Voice Remote (G9N9N)
+/// and compatible BLE remotes.
 enum RemoteKey: String, CaseIterable, Codable, Identifiable {
     case up, down, left, right, select
     case back, assistant, home, mute
@@ -318,8 +318,7 @@ enum RemoteKey: String, CaseIterable, Codable, Identifiable {
     }
 }
 
-/// Pure recognizer for future HID key-down/key-up dispatch; maps a key's
-/// physical duration to one of the two independently configured actions.
+/// Pure recognizer mapping a key's physical hold duration to tap or longPress.
 struct RemotePressClassifier {
     static func gesture(duration: TimeInterval, threshold: Double) -> RemoteGesture {
         duration >= min(5, max(0.2, threshold)) ? .longPress : .tap
@@ -421,10 +420,9 @@ struct RemoteShortcut: Codable, Hashable {
     var optionSide: RemoteModifierSide? = nil
     var controlSide: RemoteModifierSide? = nil
 
-    var hasModifier: Bool { command || shift || option || control }
+    var hasModifier: Bool { command || shift || control || option }
 
     /// A modifier may be the ONLY key (e.g. left Command for Doubao).
-    /// Keep its physical key code instead of inventing a Space main key.
     var standaloneModifier: (modifier: RemoteModifier, side: RemoteModifierSide)? {
         guard !hasModifier else { return nil }
         return RemoteModifier.location(of: keyCode)
@@ -509,13 +507,15 @@ struct RemoteShortcut: Codable, Hashable {
     }
 }
 
+/// Streamlined 4-kind binding model.
+/// Legacy `"script"` and `"voiceInput"` strings in old JSON files decode safely
+/// without failing: `"voiceInput"` normalizes to `.none` (ATVV hardware handles voice),
+/// and `"script"` migrates automatically into `RemoteLibraryStore`.
 enum RemoteBindingKind: String, Codable, CaseIterable, Identifiable {
     case none
     case keyboardShortcut
     case systemAction
-    case script
     case libraryAction
-    case voiceInput
 
     var id: String { rawValue }
 
@@ -524,9 +524,17 @@ enum RemoteBindingKind: String, Codable, CaseIterable, Identifiable {
         case .none: "不执行动作"
         case .keyboardShortcut: "按键 / 组合快捷键"
         case .systemAction: "macOS 原生系统动作"
-        case .script: "执行本地脚本"
-        case .libraryAction: "引用动作库"
-        case .voiceInput: "遥控器语音输入（待接入）"
+        case .libraryAction: "引用动作库（含脚本与多步组合）"
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        switch raw {
+        case "keyboardShortcut": self = .keyboardShortcut
+        case "systemAction": self = .systemAction
+        case "libraryAction", "script": self = .libraryAction
+        default: self = .none
         }
     }
 }
@@ -551,15 +559,81 @@ struct RemoteAction: Codable, Equatable {
     var kind: RemoteBindingKind = .none
     var shortcut: RemoteShortcut?
     var systemAction: RemoteSystemAction?
-    /// An explicitly selected local script file. Do not resolve untrusted remote content here.
-    var scriptPath: String?
-    var scriptID: UUID?
     var presetID: UUID?
+    /// Transient carrier only used to migrate v1 standalone `scriptPath` bindings
+    /// into `RemoteLibraryStore` on startup without losing user scripts.
+    var migratedScriptPath: String?
     /// How long to hold the target keyboard key down (seconds).
-    /// Nil preserves legacy profiles' short keystroke behavior.
     var outputHoldSeconds: Double?
     /// Nil keeps existing saved actions in fixed-duration mode.
     var outputHoldMode: RemoteOutputHoldMode?
+
+    enum CodingKeys: String, CodingKey {
+        case kind, shortcut, systemAction, presetID
+        case migratedScriptPath = "scriptPath"
+        case legacyScriptID = "scriptID"
+        case outputHoldSeconds, outputHoldMode
+    }
+
+    init(
+        kind: RemoteBindingKind = .none,
+        shortcut: RemoteShortcut? = nil,
+        systemAction: RemoteSystemAction? = nil,
+        presetID: UUID? = nil,
+        migratedScriptPath: String? = nil,
+        outputHoldSeconds: Double? = nil,
+        outputHoldMode: RemoteOutputHoldMode? = nil
+    ) {
+        self.kind = kind
+        self.shortcut = shortcut
+        self.systemAction = systemAction
+        self.presetID = presetID
+        self.migratedScriptPath = migratedScriptPath
+        self.outputHoldSeconds = outputHoldSeconds
+        self.outputHoldMode = outputHoldMode
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let rawKind = (try? c.decode(String.self, forKey: .kind)) ?? "none"
+        let decodedPath = try c.decodeIfPresent(String.self, forKey: .migratedScriptPath)
+        let legacyScriptID = try c.decodeIfPresent(UUID.self, forKey: .legacyScriptID)
+        let decodedPresetID = try c.decodeIfPresent(UUID.self, forKey: .presetID)
+
+        if rawKind == "script" {
+            if let path = decodedPath, !path.isEmpty {
+                kind = .libraryAction
+                migratedScriptPath = path
+                presetID = decodedPresetID
+            } else if let legacyScriptID {
+                kind = .libraryAction
+                presetID = legacyScriptID
+            } else {
+                kind = .none
+            }
+        } else {
+            kind = (try? c.decode(RemoteBindingKind.self, forKey: .kind)) ?? .none
+            presetID = decodedPresetID
+            if kind == .libraryAction, presetID == nil, let path = decodedPath, !path.isEmpty {
+                migratedScriptPath = path
+            }
+        }
+        shortcut = try c.decodeIfPresent(RemoteShortcut.self, forKey: .shortcut)
+        systemAction = try c.decodeIfPresent(RemoteSystemAction.self, forKey: .systemAction)
+        outputHoldSeconds = try c.decodeIfPresent(Double.self, forKey: .outputHoldSeconds)
+        outputHoldMode = try c.decodeIfPresent(RemoteOutputHoldMode.self, forKey: .outputHoldMode)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(kind, forKey: .kind)
+        try c.encodeIfPresent(shortcut, forKey: .shortcut)
+        try c.encodeIfPresent(systemAction, forKey: .systemAction)
+        try c.encodeIfPresent(presetID, forKey: .presetID)
+        try c.encodeIfPresent(migratedScriptPath, forKey: .migratedScriptPath)
+        try c.encodeIfPresent(outputHoldSeconds, forKey: .outputHoldSeconds)
+        try c.encodeIfPresent(outputHoldMode, forKey: .outputHoldMode)
+    }
 
     var effectiveHoldMode: RemoteOutputHoldMode { outputHoldMode ?? .timed }
 
@@ -569,7 +643,8 @@ struct RemoteAction: Codable, Equatable {
 
     var summary: String {
         switch kind {
-        case .none: return "未配置"
+        case .none:
+            return "未配置"
         case .keyboardShortcut:
             guard let shortcut else { return "等待录制" }
             if effectiveHoldMode == .physical { return "\(shortcut.display) · 跟随实体按住" }
@@ -578,11 +653,11 @@ struct RemoteAction: Codable, Equatable {
                 : shortcut.display
         case .systemAction:
             return systemAction.map { "\($0.title) · 系统调用" } ?? "选择系统动作"
-        case .script:
-            return scriptPath.map { URL(fileURLWithPath: $0).lastPathComponent } ??
-                   (scriptID != nil ? "脚本库 · 已关联" : "等待选择脚本")
-        case .libraryAction: return "动作库 · 已关联"
-        case .voiceInput: return "语音输入 · 待接入"
+        case .libraryAction:
+            if let migratedScriptPath {
+                return URL(fileURLWithPath: migratedScriptPath).lastPathComponent
+            }
+            return "动作库 · 已关联"
         }
     }
 }
@@ -592,14 +667,89 @@ struct RemoteBinding: Codable, Equatable {
     var kind: RemoteBindingKind = .none
     var shortcut: RemoteShortcut?
     var systemAction: RemoteSystemAction?
-    var scriptPath: String?
-    var scriptID: UUID?
     var presetID: UUID?
+    var migratedScriptPath: String?
     var outputHoldSeconds: Double?
     var outputHoldMode: RemoteOutputHoldMode?
     var longPressAction: RemoteAction?
     /// Duration the *physical* remote key must remain depressed to count as a long press.
     var longPressThreshold: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case kind, shortcut, systemAction, presetID
+        case migratedScriptPath = "scriptPath"
+        case legacyScriptID = "scriptID"
+        case outputHoldSeconds, outputHoldMode
+        case longPressAction, longPressThreshold
+    }
+
+    init(
+        kind: RemoteBindingKind = .none,
+        shortcut: RemoteShortcut? = nil,
+        systemAction: RemoteSystemAction? = nil,
+        presetID: UUID? = nil,
+        migratedScriptPath: String? = nil,
+        outputHoldSeconds: Double? = nil,
+        outputHoldMode: RemoteOutputHoldMode? = nil,
+        longPressAction: RemoteAction? = nil,
+        longPressThreshold: Double? = nil
+    ) {
+        self.kind = kind
+        self.shortcut = shortcut
+        self.systemAction = systemAction
+        self.presetID = presetID
+        self.migratedScriptPath = migratedScriptPath
+        self.outputHoldSeconds = outputHoldSeconds
+        self.outputHoldMode = outputHoldMode
+        self.longPressAction = longPressAction
+        self.longPressThreshold = longPressThreshold
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let rawKind = (try? c.decode(String.self, forKey: .kind)) ?? "none"
+        let decodedPath = try c.decodeIfPresent(String.self, forKey: .migratedScriptPath)
+        let legacyScriptID = try c.decodeIfPresent(UUID.self, forKey: .legacyScriptID)
+        let decodedPresetID = try c.decodeIfPresent(UUID.self, forKey: .presetID)
+
+        if rawKind == "script" {
+            if let path = decodedPath, !path.isEmpty {
+                kind = .libraryAction
+                migratedScriptPath = path
+                presetID = decodedPresetID
+            } else if let legacyScriptID {
+                kind = .libraryAction
+                presetID = legacyScriptID
+            } else {
+                kind = .none
+            }
+        } else {
+            kind = (try? c.decode(RemoteBindingKind.self, forKey: .kind)) ?? .none
+            presetID = decodedPresetID
+            if kind == .libraryAction, presetID == nil, let path = decodedPath, !path.isEmpty {
+                migratedScriptPath = path
+            }
+        }
+        shortcut = try c.decodeIfPresent(RemoteShortcut.self, forKey: .shortcut)
+        systemAction = try c.decodeIfPresent(RemoteSystemAction.self, forKey: .systemAction)
+        outputHoldSeconds = try c.decodeIfPresent(Double.self, forKey: .outputHoldSeconds)
+        outputHoldMode = try c.decodeIfPresent(RemoteOutputHoldMode.self, forKey: .outputHoldMode)
+        longPressAction = try c.decodeIfPresent(RemoteAction.self, forKey: .longPressAction)
+        longPressThreshold = try c.decodeIfPresent(Double.self, forKey: .longPressThreshold)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(kind, forKey: .kind)
+        try c.encodeIfPresent(shortcut, forKey: .shortcut)
+        try c.encodeIfPresent(systemAction, forKey: .systemAction)
+        try c.encodeIfPresent(presetID, forKey: .presetID)
+        try c.encodeIfPresent(migratedScriptPath, forKey: .migratedScriptPath)
+        try c.encodeIfPresent(outputHoldSeconds, forKey: .outputHoldSeconds)
+        try c.encodeIfPresent(outputHoldMode, forKey: .outputHoldMode)
+        try c.encodeIfPresent(longPressAction, forKey: .longPressAction)
+        try c.encodeIfPresent(longPressThreshold, forKey: .longPressThreshold)
+    }
 
     var effectiveThreshold: Double {
         min(5, max(0.2, longPressThreshold ?? 0.65))
@@ -607,11 +757,15 @@ struct RemoteBinding: Codable, Equatable {
 
     func action(for gesture: RemoteGesture) -> RemoteAction {
         if gesture == .longPress { return longPressAction ?? RemoteAction() }
-        return RemoteAction(kind: kind, shortcut: shortcut,
-                            systemAction: systemAction,
-                            scriptPath: scriptPath, scriptID: scriptID,
-                            presetID: presetID, outputHoldSeconds: outputHoldSeconds,
-                            outputHoldMode: outputHoldMode)
+        return RemoteAction(
+            kind: kind,
+            shortcut: shortcut,
+            systemAction: systemAction,
+            presetID: presetID,
+            migratedScriptPath: migratedScriptPath,
+            outputHoldSeconds: outputHoldSeconds,
+            outputHoldMode: outputHoldMode
+        )
     }
 
     mutating func setAction(_ action: RemoteAction, for gesture: RemoteGesture) {
@@ -619,9 +773,8 @@ struct RemoteBinding: Codable, Equatable {
             kind = action.kind
             shortcut = action.shortcut
             systemAction = action.systemAction
-            scriptPath = action.scriptPath
-            scriptID = action.scriptID
             presetID = action.presetID
+            migratedScriptPath = action.migratedScriptPath
             outputHoldSeconds = action.outputHoldSeconds
             outputHoldMode = action.outputHoldMode
         } else {

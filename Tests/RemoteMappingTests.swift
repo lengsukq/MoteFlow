@@ -445,18 +445,63 @@ final class RemoteMappingTests: XCTestCase {
         XCTAssertEqual(reloaded.binding(for: .home).shortcut, shortcut)
         XCTAssertEqual(reloaded.configuredCount, 1)
 
-        reloaded.setKind(.voiceInput, for: .home)
+        reloaded.setKind(.systemAction, for: .home)
         XCTAssertNil(reloaded.binding(for: .home).shortcut)
-        XCTAssertEqual(reloaded.binding(for: .home).kind, .voiceInput)
+        XCTAssertEqual(reloaded.binding(for: .home).kind, .systemAction)
 
         reloaded.reset(.home)
         XCTAssertEqual(reloaded.configuredCount, 0)
 
-        reloaded.setKind(.voiceInput, for: .assistant)
+        reloaded.setKind(.libraryAction, for: .assistant)
         reloaded.setKind(.keyboardShortcut, for: .back)
         XCTAssertEqual(reloaded.configuredCount, 2)
         reloaded.resetAll()
         XCTAssertEqual(RemoteBindingStore(defaults: defaults).configuredCount, 0)
+    }
+
+    func testLegacyVoiceInputAndStandaloneScriptDecodeSafelyAndMigrate() throws {
+        let legacyVoiceJSON = Data(#"{"kind":"voiceInput"}"#.utf8)
+        let decodedVoice = try JSONDecoder().decode(RemoteAction.self, from: legacyVoiceJSON)
+        XCTAssertEqual(decodedVoice.kind, .none, "Legacy dead voiceInput enum must safely normalize to .none")
+
+        let legacyScriptJSON = Data(#"{"kind":"script","scriptPath":"/tmp/demo.sh"}"#.utf8)
+        let decodedScriptBinding = try JSONDecoder().decode(RemoteBinding.self, from: legacyScriptJSON)
+        XCTAssertEqual(decodedScriptBinding.kind, .libraryAction)
+        XCTAssertEqual(decodedScriptBinding.migratedScriptPath, "/tmp/demo.sh")
+
+        let suite = "MoteFlow.legacy-script-migration.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let tempLib = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MoteFlow-mig-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("ActionLibrary.json")
+        defer { try? FileManager.default.removeItem(at: tempLib.deletingLastPathComponent()) }
+
+        defaults.set(try JSONEncoder().encode([
+            RemoteDeviceModel.googleG9N9N.id: [RemoteKey.tv: decodedScriptBinding]
+        ]), forKey: "MoteFlow.remoteModels.v1")
+
+        let store = RemoteBindingStore(defaults: defaults)
+        let library = RemoteLibraryStore(storageURL: tempLib)
+        store.migrateLegacyScriptBindingsIfNeeded(into: library)
+
+        let migrated = store.action(for: .tv, gesture: .tap)
+        XCTAssertEqual(migrated.kind, .libraryAction)
+        XCTAssertNil(migrated.migratedScriptPath)
+        XCTAssertNotNil(migrated.presetID)
+        XCTAssertEqual(library.steps(for: migrated)?.first?.scriptPath, "/tmp/demo.sh")
+
+        // Also verify legacy standalone HID JSON upgrades cleanly into RemoteConfigBackupDocument
+        let sampleHID = RemoteHIDProfile(
+            device: RemoteHIDDeviceIdentity(
+                vendorID: 6353, productID: 37968,
+                productName: "Chromecast Remote", transport: "Bluetooth Low Energy"
+            ),
+            codes: [.menu: RemoteHIDButtonCode(reportID: 1, code: 22)]
+        )
+        let legacyHIDData = try sampleHID.exportData()
+        let upgradedDoc = try RemoteConfigBackupDocument.importJSONData(legacyHIDData)
+        XCTAssertEqual(upgradedDoc.snapshot.learnedHIDProfile?.entries.count, 1)
     }
 
     func testShortcutIdentityIgnoresKeyboardLayoutLabel() {

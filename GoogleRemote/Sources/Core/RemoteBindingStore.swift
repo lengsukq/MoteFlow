@@ -10,8 +10,8 @@ struct RemoteNamedMappingProfile: Codable, Equatable, Identifiable {
     var bindings: [RemoteKey: RemoteBinding]
 }
 
-/// Persistent, local-only mapping configuration plus portable backup/export/import
-/// and local snapshot history.
+/// Persistent, local-only mapping configuration plus unified portable JSON backup/export/import
+/// (including custom learned HID hardware codes) and local snapshot history.
 @MainActor
 final class RemoteBindingStore: ObservableObject {
     @Published private(set) var bindings: [RemoteKey: RemoteBinding] = [:]
@@ -70,8 +70,46 @@ final class RemoteBindingStore: ObservableObject {
         loadLocalBackupIndex()
     }
 
+    /// Seamlessly promotes any historical `.script` path bindings into unified `RemoteLibraryStore`
+    /// actions on launch so users keep 100% of existing custom scripts without a duplicate binding type.
+    func migrateLegacyScriptBindingsIfNeeded(into library: RemoteLibraryStore) {
+        savedModels[activeModel.id] = bindings
+        var didChange = false
+
+        func migrateMap(_ map: [RemoteKey: RemoteBinding]) -> [RemoteKey: RemoteBinding] {
+            var next = map
+            for (key, var item) in map {
+                for gesture in RemoteGesture.allCases {
+                    var act = item.action(for: gesture)
+                    if let path = act.migratedScriptPath, act.presetID == nil {
+                        if let newID = library.findOrCreateMigratedScriptAction(scriptPath: path) {
+                            act.kind = .libraryAction
+                            act.presetID = newID
+                            act.migratedScriptPath = nil
+                            item.setAction(act, for: gesture)
+                            didChange = true
+                        }
+                    }
+                }
+                next[key] = item
+            }
+            return next
+        }
+
+        for (modelID, map) in savedModels {
+            savedModels[modelID] = migrateMap(map)
+        }
+        for idx in namedProfiles.indices {
+            namedProfiles[idx].bindings = migrateMap(namedProfiles[idx].bindings)
+        }
+        if didChange {
+            bindings = savedModels[activeModel.id] ?? bindings
+            save()
+        }
+    }
+
     /// Model-scoped actions: switching remotes must never overwrite the user's
-    /// existing Chromecast mappings. Auto-execution remains a separate opt-in.
+    /// existing Chromecast mappings.
     func selectModel(_ model: RemoteDeviceModel) {
         guard model != activeModel else { return }
         savedModels[activeModel.id] = bindings
@@ -253,17 +291,36 @@ final class RemoteBindingStore: ObservableObject {
         save()
     }
 
-    // MARK: - Portable JSON Export / Import & Local Snapshot Backups
+    // MARK: - Unified Portable JSON Export / Import & Local Snapshot Backups
 
-    func exportBackupDocument(peerName: String, note: String? = nil, library: RemoteLibraryStore) -> RemoteConfigBackupDocument {
+    func exportBackupDocument(
+        peerName: String,
+        note: String? = nil,
+        library: RemoteLibraryStore,
+        learnedHIDProfile: RemoteHIDProfile? = nil
+    ) -> RemoteConfigBackupDocument {
         RemoteConfigBackupDocument(
             note: note,
-            snapshot: exportSyncSnapshot(peerName: peerName, library: library)
+            snapshot: exportSyncSnapshot(
+                peerName: peerName,
+                library: library,
+                learnedHIDProfile: learnedHIDProfile
+            )
         )
     }
 
-    func exportBackupJSONData(peerName: String, note: String? = nil, library: RemoteLibraryStore) throws -> Data {
-        try exportBackupDocument(peerName: peerName, note: note, library: library).exportJSONData()
+    func exportBackupJSONData(
+        peerName: String,
+        note: String? = nil,
+        library: RemoteLibraryStore,
+        learnedHIDProfile: RemoteHIDProfile? = nil
+    ) throws -> Data {
+        try exportBackupDocument(
+            peerName: peerName,
+            note: note,
+            library: library,
+            learnedHIDProfile: learnedHIDProfile
+        ).exportJSONData()
     }
 
     @discardableResult
@@ -271,12 +328,18 @@ final class RemoteBindingStore: ObservableObject {
         label: String,
         peerName: String,
         library: RemoteLibraryStore,
+        learnedHIDProfile: RemoteHIDProfile? = nil,
         isAutomaticSafetyBackup: Bool = false
     ) throws -> RemoteLocalBackupRecord {
         try FileManager.default.createDirectory(at: backupDirectoryURL, withIntermediateDirectories: true)
         let id = UUID()
         let fileName = "backup-\(id.uuidString).json"
-        let doc = exportBackupDocument(peerName: peerName, note: label, library: library)
+        let doc = exportBackupDocument(
+            peerName: peerName,
+            note: label,
+            library: library,
+            learnedHIDProfile: learnedHIDProfile
+        )
         let data = try doc.exportJSONData()
         try data.write(to: backupDirectoryURL.appendingPathComponent(fileName), options: .atomic)
 
@@ -289,6 +352,7 @@ final class RemoteBindingStore: ObservableObject {
             configuredKeysCount: doc.snapshot.totalConfiguredKeyCount,
             namedProfilesCount: doc.snapshot.namedProfiles.count,
             libraryActionsCount: doc.snapshot.libraryActions.count,
+            learnedHIDKeysCount: doc.snapshot.learnedHIDProfile?.entries.count ?? 0,
             isAutomaticSafetyBackup: isAutomaticSafetyBackup
         )
         localBackups.insert(record, at: 0)
@@ -301,7 +365,8 @@ final class RemoteBindingStore: ObservableObject {
     func restoreLocalBackup(
         _ id: UUID,
         strategy: RemoteConfigSyncStrategy,
-        library: RemoteLibraryStore
+        library: RemoteLibraryStore,
+        onRestoreHIDProfile: ((RemoteHIDProfile) -> Int)? = nil
     ) throws -> RemoteConfigSyncResult {
         guard let record = localBackups.first(where: { $0.id == id }) else {
             throw RemoteConfigBackupError.corruptedData("本地备份记录不存在或已被清理")
@@ -315,7 +380,8 @@ final class RemoteBindingStore: ObservableObject {
             labeledSnapshot,
             strategy: strategy,
             library: library,
-            createSafetyBackupOnOverwrite: !record.isAutomaticSafetyBackup
+            createSafetyBackupOnOverwrite: !record.isAutomaticSafetyBackup,
+            onRestoreHIDProfile: onRestoreHIDProfile
         )
     }
 
@@ -358,7 +424,11 @@ final class RemoteBindingStore: ObservableObject {
 
     // MARK: - Dual-Mac Configuration Export & Merge / Overwrite Sync
 
-    func exportSyncSnapshot(peerName: String, library: RemoteLibraryStore) -> RemoteSyncConfigSnapshot {
+    func exportSyncSnapshot(
+        peerName: String,
+        library: RemoteLibraryStore,
+        learnedHIDProfile: RemoteHIDProfile? = nil
+    ) -> RemoteSyncConfigSnapshot {
         var allModels = savedModels
         allModels[activeModel.id] = bindings
         for model in RemoteDeviceModel.allCases where allModels[model.id] == nil {
@@ -370,7 +440,8 @@ final class RemoteBindingStore: ObservableObject {
             activeModel: activeModel,
             modelBindings: allModels,
             namedProfiles: namedProfiles,
-            libraryActions: library.exportSyncableActions()
+            libraryActions: library.exportSyncableActions(),
+            learnedHIDProfile: learnedHIDProfile
         ).sanitized()
     }
 
@@ -379,10 +450,28 @@ final class RemoteBindingStore: ObservableObject {
         _ rawSnapshot: RemoteSyncConfigSnapshot,
         strategy: RemoteConfigSyncStrategy,
         library: RemoteLibraryStore,
-        createSafetyBackupOnOverwrite: Bool = true
+        createSafetyBackupOnOverwrite: Bool = true,
+        onRestoreHIDProfile: ((RemoteHIDProfile) -> Int)? = nil
     ) -> RemoteConfigSyncResult {
         let snapshot = rawSnapshot.sanitized()
         savedModels[activeModel.id] = bindings
+
+        var restoredHIDCount = 0
+        if let hidProfile = snapshot.learnedHIDProfile, let onRestoreHIDProfile {
+            restoredHIDCount = onRestoreHIDProfile(hidProfile)
+        }
+        // If importing a legacy standalone HID-only file (`modelBindings` empty), skip clobbering action bindings!
+        if snapshot.modelBindings.isEmpty && snapshot.namedProfiles.isEmpty && snapshot.libraryActions.isEmpty {
+            return RemoteConfigSyncResult(
+                strategy: strategy,
+                sourcePeerName: snapshot.sourcePeerName,
+                updatedKeyGestureCount: 0,
+                syncedProfileCount: 0,
+                syncedLibraryActionCount: 0,
+                restoredHIDKeyCount: restoredHIDCount,
+                createdSafetyBackup: false
+            )
+        }
 
         var createdSafety = false
         if strategy == .overwrite && createSafetyBackupOnOverwrite {
@@ -440,10 +529,13 @@ final class RemoteBindingStore: ObservableObject {
                     let prev = previousMap[key] ?? RemoteBinding()
                     var incoming = remoteMap[key] ?? RemoteBinding()
                     for gesture in RemoteGesture.allCases {
-                        if prev.action(for: gesture).kind == .script &&
-                            !Self.isActionConfigured(incoming.action(for: gesture)) {
-                            incoming.setAction(prev.action(for: gesture), for: gesture)
-                        } else if prev.action(for: gesture) != incoming.action(for: gesture) {
+                        let prevAct = prev.action(for: gesture)
+                        let prevIsLocalScript = prevAct.migratedScriptPath != nil ||
+                            (prevAct.kind == .libraryAction &&
+                             (library.action(prevAct.presetID)?.steps.contains(where: { $0.kind == .script }) ?? false))
+                        if prevIsLocalScript && !Self.isActionConfigured(incoming.action(for: gesture)) {
+                            incoming.setAction(prevAct, for: gesture)
+                        } else if prevAct != incoming.action(for: gesture) {
                             updatedGestures += 1
                         }
                     }
@@ -519,6 +611,7 @@ final class RemoteBindingStore: ObservableObject {
             updatedKeyGestureCount: updatedGestures,
             syncedProfileCount: syncedProfileCount,
             syncedLibraryActionCount: syncedLibraryCount,
+            restoredHIDKeyCount: restoredHIDCount,
             createdSafetyBackup: createdSafety
         )
     }
@@ -532,11 +625,7 @@ final class RemoteBindingStore: ObservableObject {
         case .systemAction:
             action.systemAction != nil
         case .libraryAction:
-            action.presetID != nil
-        case .script:
-            action.scriptPath != nil || action.scriptID != nil
-        case .voiceInput:
-            true
+            action.presetID != nil || action.migratedScriptPath != nil
         }
     }
 
@@ -663,23 +752,11 @@ final class RemoteBindingStore: ObservableObject {
         action.kind = .keyboardShortcut
         action.shortcut = shortcut
         action.systemAction = nil
-        action.scriptPath = nil
+        action.migratedScriptPath = nil
         binding.setAction(action, for: gesture)
         bindings[key] = binding
         save()
         return true
-    }
-
-    func setScript(_ path: String, for key: RemoteKey, gesture: RemoteGesture) {
-        var binding = binding(for: key)
-        var action = binding.action(for: gesture)
-        action.kind = .script
-        action.scriptPath = path
-        action.shortcut = nil
-        action.systemAction = nil
-        binding.setAction(action, for: gesture)
-        bindings[key] = binding
-        save()
     }
 
     func setOutputHold(_ seconds: Double, for key: RemoteKey, gesture: RemoteGesture) {

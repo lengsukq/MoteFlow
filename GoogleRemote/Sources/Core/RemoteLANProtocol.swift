@@ -54,8 +54,7 @@ enum RemoteRelayDispatchMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-/// User-facing choice on whichever Mac screen the user is currently operating:
-/// "跟随远程的遥控器设置" vs "跟随本机的遥控器设置".
+/// User-facing choice on whichever Mac screen the user is currently operating.
 enum RemoteMappingFollowSource: String, Codable, CaseIterable, Identifiable {
     case followRemoteMac
     case followLocalMac
@@ -117,7 +116,7 @@ enum RemoteConfigSyncStrategy: String, Codable, CaseIterable, Identifiable {
 }
 
 /// Sanitized, script-free configuration payload used by both LAN Dual-Mac sync
-/// and portable JSON backup export/import.
+/// and portable JSON backup export/import (including optional learned HID codes).
 struct RemoteSyncConfigSnapshot: Codable, Equatable {
     var sourcePeerName: String
     var exportedAt: Date = Date()
@@ -125,6 +124,7 @@ struct RemoteSyncConfigSnapshot: Codable, Equatable {
     var modelBindings: [String: [RemoteKey: RemoteBinding]]
     var namedProfiles: [RemoteNamedMappingProfile]
     var libraryActions: [RemoteLibraryAction]
+    var learnedHIDProfile: RemoteHIDProfile? = nil
 
     var totalConfiguredKeyCount: Int {
         modelBindings.values.reduce(0) { partial, dict in
@@ -135,11 +135,17 @@ struct RemoteSyncConfigSnapshot: Codable, Equatable {
     /// Strips any raw shell/script execution steps or script file paths so LAN sync
     /// and external backup imports can never silently inject executable shell code.
     func sanitized() -> RemoteSyncConfigSnapshot {
+        let unsafeActionIDs = Set(
+            libraryActions.filter { item in
+                item.steps.allSatisfy { $0.kind == .script }
+            }.map(\.id)
+        )
+
         var cleanModels: [String: [RemoteKey: RemoteBinding]] = [:]
         for (modelID, dict) in modelBindings {
             var cleanDict: [RemoteKey: RemoteBinding] = [:]
             for (key, binding) in dict {
-                cleanDict[key] = Self.sanitizeBinding(binding)
+                cleanDict[key] = Self.sanitizeBinding(binding, unsafeActionIDs: unsafeActionIDs)
             }
             cleanModels[modelID] = cleanDict
         }
@@ -147,7 +153,7 @@ struct RemoteSyncConfigSnapshot: Codable, Equatable {
         let cleanProfiles = namedProfiles.map { profile in
             var cleanDict: [RemoteKey: RemoteBinding] = [:]
             for (key, binding) in profile.bindings {
-                cleanDict[key] = Self.sanitizeBinding(binding)
+                cleanDict[key] = Self.sanitizeBinding(binding, unsafeActionIDs: unsafeActionIDs)
             }
             return RemoteNamedMappingProfile(
                 id: profile.id,
@@ -168,25 +174,38 @@ struct RemoteSyncConfigSnapshot: Codable, Equatable {
             )
         }
 
+        let cleanHID: RemoteHIDProfile?
+        if let profile = learnedHIDProfile, (try? profile.validatedCodes()) != nil {
+            cleanHID = profile
+        } else {
+            cleanHID = nil
+        }
+
         return RemoteSyncConfigSnapshot(
             sourcePeerName: sourcePeerName,
             exportedAt: exportedAt,
             activeModel: activeModel,
             modelBindings: cleanModels,
             namedProfiles: cleanProfiles,
-            libraryActions: cleanLibrary
+            libraryActions: cleanLibrary,
+            learnedHIDProfile: cleanHID
         )
     }
 
-    private static func sanitizeBinding(_ binding: RemoteBinding) -> RemoteBinding {
+    private static func sanitizeBinding(
+        _ binding: RemoteBinding,
+        unsafeActionIDs: Set<UUID>
+    ) -> RemoteBinding {
         var copy = binding
-        let tap = copy.action(for: .tap)
-        if tap.kind == .script {
-            copy.setAction(RemoteAction(), for: .tap)
-        }
-        let hold = copy.action(for: .longPress)
-        if hold.kind == .script {
-            copy.setAction(RemoteAction(), for: .longPress)
+        for gesture in RemoteGesture.allCases {
+            let act = copy.action(for: gesture)
+            if act.migratedScriptPath != nil {
+                copy.setAction(RemoteAction(), for: gesture)
+            } else if act.kind == .libraryAction,
+                      let id = act.presetID,
+                      unsafeActionIDs.contains(id) {
+                copy.setAction(RemoteAction(), for: gesture)
+            }
         }
         return copy
     }
@@ -202,14 +221,16 @@ enum RemoteConfigBackupError: LocalizedError, Equatable {
         case .fileTooLarge(let bytes):
             "备份文件过大（\(bytes) 字节），请选择不超过 1 MB 的 MoteFlow 配置备份文件。"
         case .unsupportedFormat:
-            "无法识别该 JSON 文件格式：请选择由 MoteFlow 导出的配置备份文件（如需导入底层 HID 硬件码，请前往「高级适配」页）。"
+            "无法识别该 JSON 文件格式：请选择由 MoteFlow 导出的配置备份文件。"
         case .corruptedData(let detail):
             "备份文件解析失败：\(detail)"
         }
     }
 }
 
-/// Portable, versioned JSON backup envelope for full MoteFlow configuration export & import.
+/// Unified, versioned JSON backup envelope for full MoteFlow configuration export & import
+/// (mappings, named schemes, action library, AND custom learned HID codes).
+/// Also transparently upgrades legacy standalone `RemoteHIDProfile` JSON files.
 struct RemoteConfigBackupDocument: Codable, Equatable {
     static let currentFormat = "moteflow.config.backup"
     static let maxImportBytes = 1_048_576
@@ -238,26 +259,48 @@ struct RemoteConfigBackupDocument: Codable, Equatable {
         }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let doc: RemoteConfigBackupDocument
-        do {
-            doc = try decoder.decode(RemoteConfigBackupDocument.self, from: data)
-        } catch {
-            // Fallback for standard default date encoding if edited or legacy
-            if let fallback = try? JSONDecoder().decode(RemoteConfigBackupDocument.self, from: data) {
-                doc = fallback
-            } else {
-                throw RemoteConfigBackupError.unsupportedFormat
-            }
+        if let doc = try? decoder.decode(RemoteConfigBackupDocument.self, from: data),
+           doc.format == currentFormat, doc.version == 1 {
+            return RemoteConfigBackupDocument(
+                format: doc.format,
+                version: doc.version,
+                note: doc.note,
+                snapshot: doc.snapshot.sanitized()
+            )
         }
-        guard doc.format == currentFormat, doc.version == 1 else {
-            throw RemoteConfigBackupError.unsupportedFormat
+        if let fallback = try? JSONDecoder().decode(RemoteConfigBackupDocument.self, from: data),
+           fallback.format == currentFormat, fallback.version == 1 {
+            return RemoteConfigBackupDocument(
+                format: fallback.format,
+                version: fallback.version,
+                note: fallback.note,
+                snapshot: fallback.snapshot.sanitized()
+            )
         }
-        return RemoteConfigBackupDocument(
-            format: doc.format,
-            version: doc.version,
-            note: doc.note,
-            snapshot: doc.snapshot.sanitized()
-        )
+        // Seamless backward compatibility: also accept legacy standalone HID JSON files!
+        if let legacyHID = try? RemoteHIDProfile.importData(data) {
+            let model = RemoteDeviceProfileRegistry.identify(
+                vendorID: legacyHID.device.vendorID,
+                productID: legacyHID.device.productID,
+                productName: legacyHID.device.productName
+            ) ?? .googleG9N9N
+            let wrapped = RemoteSyncConfigSnapshot(
+                sourcePeerName: "\(legacyHID.device.productName) 硬件码备份",
+                exportedAt: legacyHID.createdAt,
+                activeModel: model,
+                modelBindings: [:],
+                namedProfiles: [],
+                libraryActions: [],
+                learnedHIDProfile: legacyHID
+            )
+            return RemoteConfigBackupDocument(
+                format: currentFormat,
+                version: 1,
+                note: "从旧版硬件码文件升级导入",
+                snapshot: wrapped
+            )
+        }
+        throw RemoteConfigBackupError.unsupportedFormat
     }
 }
 
@@ -270,6 +313,7 @@ struct RemoteLocalBackupRecord: Codable, Identifiable, Equatable {
     var configuredKeysCount: Int
     var namedProfilesCount: Int
     var libraryActionsCount: Int
+    var learnedHIDKeysCount: Int = 0
     var isAutomaticSafetyBackup: Bool = false
 }
 
@@ -279,6 +323,7 @@ struct RemoteConfigSyncResult: Equatable {
     let updatedKeyGestureCount: Int
     let syncedProfileCount: Int
     let syncedLibraryActionCount: Int
+    let restoredHIDKeyCount: Int
     let createdSafetyBackup: Bool
 
     init(
@@ -287,6 +332,7 @@ struct RemoteConfigSyncResult: Equatable {
         updatedKeyGestureCount: Int,
         syncedProfileCount: Int,
         syncedLibraryActionCount: Int,
+        restoredHIDKeyCount: Int = 0,
         createdSafetyBackup: Bool = false
     ) {
         self.strategy = strategy
@@ -294,16 +340,18 @@ struct RemoteConfigSyncResult: Equatable {
         self.updatedKeyGestureCount = updatedKeyGestureCount
         self.syncedProfileCount = syncedProfileCount
         self.syncedLibraryActionCount = syncedLibraryActionCount
+        self.restoredHIDKeyCount = restoredHIDKeyCount
         self.createdSafetyBackup = createdSafetyBackup
     }
 
     var summaryMessage: String {
+        let hidHint = restoredHIDKeyCount > 0 ? "、恢复 \(restoredHIDKeyCount) 个自定义硬件码" : ""
         switch strategy {
         case .merge:
-            return "已从「\(sourcePeerName)」合并配置：补全 \(updatedKeyGestureCount) 项按键动作、新增 \(syncedProfileCount) 个方案、\(syncedLibraryActionCount) 个动作库条目（原有设置已保留）"
+            return "已从「\(sourcePeerName)」合并配置：补全 \(updatedKeyGestureCount) 项按键动作、新增 \(syncedProfileCount) 个方案、\(syncedLibraryActionCount) 个动作库条目\(hidHint)"
         case .overwrite:
             let safetyHint = createdSafetyBackup ? "（已自动保存覆盖前备份）" : ""
-            return "已用「\(sourcePeerName)」覆盖配置：更新 \(updatedKeyGestureCount) 项按键动作、同步 \(syncedProfileCount) 个方案、\(syncedLibraryActionCount) 个动作库条目\(safetyHint)"
+            return "已用「\(sourcePeerName)」覆盖配置：更新 \(updatedKeyGestureCount) 项按键动作、同步 \(syncedProfileCount) 个方案、\(syncedLibraryActionCount) 个动作库条目\(hidHint)\(safetyHint)"
         }
     }
 }
@@ -434,8 +482,6 @@ enum RemoteLANAuth {
         return diff == 0
     }
 
-    /// Deterministic 6-digit verification code displayed identically on both Macs
-    /// during click-to-confirm LAN pairing.
     static func verificationCode(
         clientID: String,
         serverID: String,
@@ -454,15 +500,12 @@ enum RemoteLANAuth {
         return "\(formatted.prefix(3)) \(formatted.suffix(3))"
     }
 
-    /// Deterministic glare-avoidance delay when two mutually trusted Macs discover
-    /// each other simultaneously on the LAN.
     static func autoConnectDelaySeconds(localPeerID: String, remotePeerID: String) -> Double {
         localPeerID < remotePeerID ? 0.35 : 2.25
     }
 }
 
 /// Safe subset of multi-step library actions allowed to cross LAN in senderMapping mode.
-/// Arbitrary shell script source is intentionally excluded from network execution.
 struct RemoteLANForwardedStep: Codable, Equatable {
     var kind: RemoteActionStepKind
     var shortcut: RemoteShortcut?
