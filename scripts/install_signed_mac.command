@@ -4,7 +4,13 @@ set -euo pipefail
 # Consistent Apple Development signature and installation path are essential
 # for macOS Input Monitoring / Accessibility TCC permissions across rebuilds.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="${MOTEFLOW_INSTALL_DIR:-$HOME/Applications}"
+if [[ -n "${MOTEFLOW_INSTALL_DIR:-}" ]]; then
+  DEST="$MOTEFLOW_INSTALL_DIR"
+elif [[ -d "/Applications/MoteFlow.app" && ! -d "$HOME/Applications/MoteFlow.app" ]]; then
+  DEST="/Applications"
+else
+  DEST="$HOME/Applications"
+fi
 TEAM="${MOTEFLOW_DEVELOPMENT_TEAM:-${GOOGLE_REMOTE_DEVELOPMENT_TEAM:-}}"
 ALLOW_ADHOC="${MOTEFLOW_ALLOW_ADHOC:-0}"
 cd "$ROOT"
@@ -41,11 +47,16 @@ build_with_command_line_tools() {
 
   local arch
   arch="$(uname -m)"
+  local swift_sources=()
+  while IFS= read -r -d '' src_file; do
+    swift_sources+=("$src_file")
+  done < <(find GoogleRemote/Sources -type f -name '*.swift' -print0 | sort -z)
+
   swiftc -O \
     -sdk "$sdk_path" \
     "${plugin_args[@]}" \
     -target "${arch}-apple-macos14.0" \
-    GoogleRemote/Sources/*.swift \
+    "${swift_sources[@]}" \
     -o "$STAGED/Contents/MacOS/MoteFlow"
 
   # Package multi-resolution AppIcon.icns directly from PNG assets
@@ -101,9 +112,9 @@ PY
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.3.0</string>
+    <string>1.5.1</string>
     <key>CFBundleVersion</key>
-    <string>3</string>
+    <string>6</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key>
