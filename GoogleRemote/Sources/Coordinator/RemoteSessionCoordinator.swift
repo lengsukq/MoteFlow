@@ -3,7 +3,7 @@ import Foundation
 
 /// Central coordinator bridging HID hardware capture, ATVV Bluetooth voice,
 /// local action execution, anti-echo speaker muting, and Dual-Mac LAN relay
-/// forwarding & configuration sync.
+/// forwarding & configuration sync via an explicit `VoiceSessionStateMachine`.
 @MainActor
 final class RemoteSessionCoordinator {
     private weak var bluetooth: RemoteBluetoothManager?
@@ -16,7 +16,9 @@ final class RemoteSessionCoordinator {
     private weak var transcriber: NativeVoiceTranscriber?
     private var cancellables: Set<AnyCancellable> = []
     private var isConfigured = false
-    private var incomingVoiceUsedVirtualMicShortcut = false
+    private var voiceStateMachine = VoiceSessionStateMachine()
+
+    var onActionFeedback: ((String, RemoteKey?) -> Void)?
 
     func bindIfNeeded(
         bluetooth: RemoteBluetoothManager,
@@ -38,6 +40,9 @@ final class RemoteSessionCoordinator {
         self.actionRunner = actionRunner
         self.runtime = runtime
         self.lanRelay = lanRelay
+
+        // Migrate any historical v1 standalone `.script` bindings into unified Action Library entries
+        mappingStore.migrateLegacyScriptBindingsIfNeeded(into: actionLibrary)
 
         runtime.startKeepingRemoteAlive(
             hidCapture,
@@ -96,8 +101,6 @@ final class RemoteSessionCoordinator {
         return nil
     }
 
-    /// Resolves the voice dictation hotkey bound on `.assistant`, supporting BOTH
-    /// `.longPress` and `.tap` gestures so users who bound Doubao to tap work seamlessly.
     private func resolveVoiceAssistantShortcut(
         in store: RemoteBindingStore,
         library: RemoteLibraryStore
@@ -129,13 +132,21 @@ final class RemoteSessionCoordinator {
                   let relay = self.lanRelay,
                   monitor.executeHardwareActions,
                   relay.isForwardingToRemoteMac else { return }
-            // Suppress speaker on the sender Mac too (eliminates macOS Screen Sharing echo!)
-            self.bluetooth?.virtualMicrophone.engageSpeakerEchoSuppression()
             let shortcut = self.resolveVoiceAssistantShortcut(in: store, library: library)
+            _ = self.voiceStateMachine.beginLocalOrForwardedSession(
+                forwardingToRemote: true,
+                hasVoiceShortcut: shortcut != nil,
+                trigger: monitor.doubaoShortcutTrigger
+            )
+            self.bluetooth?.virtualMicrophone.engageSpeakerEchoSuppression()
             relay.forwardVoiceStart(
                 sampleRate: sampleRate,
                 shortcut: shortcut,
                 trigger: monitor.doubaoShortcutTrigger
+            )
+            self.onActionFeedback?(
+                "语音转发至「\(relay.connectedPeerName ?? "远端 Mac")」",
+                .assistant
             )
         }
         bluetooth.onRemoteVoiceSamples = { [weak self] samples, sampleRate in
@@ -155,45 +166,69 @@ final class RemoteSessionCoordinator {
                   let actionRunner = self.actionRunner,
                   let hidCapture = self.hidCapture else { return }
 
-            if let relay = self.lanRelay, relay.isForwardingToRemoteMac {
-                // Mute sender speaker during forwarded speech so Screen Sharing return audio cannot echo!
+            let shortcut = self.resolveVoiceAssistantShortcut(in: mappingStore, library: actionLibrary)
+            let isForwarding = (self.lanRelay?.isForwardingToRemoteMac == true)
+            guard self.voiceStateMachine.beginLocalOrForwardedSession(
+                forwardingToRemote: isForwarding,
+                hasVoiceShortcut: shortcut != nil,
+                trigger: hidCapture.doubaoShortcutTrigger
+            ) else { return }
+
+            if let relay = self.lanRelay, isForwarding {
                 self.bluetooth?.virtualMicrophone.engageSpeakerEchoSuppression()
-                let shortcut = self.resolveVoiceAssistantShortcut(in: mappingStore, library: actionLibrary)
                 let preferredRate = self.bluetooth?.preferredVoiceSampleRate ?? 8_000
                 relay.forwardVoiceStart(
                     sampleRate: preferredRate,
                     shortcut: shortcut,
                     trigger: hidCapture.doubaoShortcutTrigger
                 )
+                self.onActionFeedback?(
+                    "正在向「\(relay.connectedPeerName ?? "远端 Mac")」传送语音…",
+                    .assistant
+                )
                 return
             }
 
             self.bluetooth?.virtualMicrophone.prepareVoiceInputWindow()
-            if let shortcut = self.resolveVoiceAssistantShortcut(in: mappingStore, library: actionLibrary) {
+            if let shortcut {
                 switch hidCapture.doubaoShortcutTrigger {
                 case .tap:
                     actionRunner.tapVoiceShortcut(shortcut)
                 case .hold:
                     actionRunner.beginVoiceShortcutHold(shortcut)
                 }
+                self.onActionFeedback?("已唤起语音热键 \(shortcut.display)", .assistant)
             } else {
                 let tapAction = mappingStore.action(for: .assistant, gesture: .tap)
-                guard tapAction.kind != .none && tapAction.kind != .voiceInput else { return }
+                guard tapAction.kind != .none else { return }
                 actionRunner.test(
                     action: tapAction,
                     label: "实体语音助手 · ATVV",
                     library: actionLibrary
                 )
+                self.onActionFeedback?("已执行语音键绑定动作", .assistant)
             }
         }
 
         hidCapture.onVoiceSessionEnd = { [weak self] in
             guard let self else { return }
+            let effect = self.voiceStateMachine.endLocalOrForwardedSession()
             if let relay = self.lanRelay, relay.isForwardingToRemoteMac {
                 relay.forwardVoiceEnd()
             }
-            self.actionRunner?.endVoiceShortcutHold()
-            self.bluetooth?.virtualMicrophone.scheduleVoiceInputRestoration()
+            switch effect {
+            case .stopLocalVoice(let releaseHold, let restoreMic):
+                if releaseHold { self.actionRunner?.endVoiceShortcutHold() }
+                if restoreMic { self.bluetooth?.virtualMicrophone.scheduleVoiceInputRestoration() }
+            case .stopForwardedVoice(let releaseHold, let releaseEcho):
+                if releaseHold { self.actionRunner?.endVoiceShortcutHold() }
+                if releaseEcho { self.bluetooth?.virtualMicrophone.scheduleSpeakerEchoSuppressionRelease() }
+            case .finishIncomingRemoteVoice(let releaseHold, _, _):
+                if releaseHold { self.actionRunner?.endVoiceShortcutHold() }
+                self.bluetooth?.virtualMicrophone.scheduleVoiceInputRestoration()
+            case .none:
+                break
+            }
         }
     }
 
@@ -232,12 +267,23 @@ final class RemoteSessionCoordinator {
             let localShortcut = self.resolveHoldShortcut(for: key, in: store, library: library)
             if let relay = self.lanRelay, relay.isForwardingToRemoteMac {
                 if relay.dispatchMode == .receiverMapping || localShortcut != nil {
-                    return relay.forwardHoldStart(key: key, senderModel: model, shortcut: localShortcut)
+                    let ok = relay.forwardHoldStart(key: key, senderModel: model, shortcut: localShortcut)
+                    if ok {
+                        self.onActionFeedback?(
+                            "长按转发「\(key.title)」→ \(relay.connectedPeerName ?? "远端 Mac")",
+                            key
+                        )
+                    }
+                    return ok
                 }
                 return false
             }
             guard let localShortcut else { return false }
-            return self.actionRunner?.beginMappedShortcutHold(localShortcut, for: key) ?? false
+            let ok = self.actionRunner?.beginMappedShortcutHold(localShortcut, for: key) ?? false
+            if ok {
+                self.onActionFeedback?("按住「\(key.title)」→ \(localShortcut.display)", key)
+            }
+            return ok
         }
 
         hidCapture.onMappedHoldEnd = { [weak self] key in
@@ -261,6 +307,7 @@ final class RemoteSessionCoordinator {
             let action = store.action(for: key, gesture: gesture)
             if action.kind == .systemAction && action.systemAction == .switchMacTarget {
                 self.lanRelay?.toggleTarget(showHUD: true)
+                self.onActionFeedback?("已切换双机控制目标", key)
                 return
             }
 
@@ -272,15 +319,21 @@ final class RemoteSessionCoordinator {
                     senderModel: model,
                     library: library
                 )
+                self.onActionFeedback?(
+                    "已转发「\(key.title) · \(gesture.title)」→ \(relay.connectedPeerName ?? "远端 Mac")",
+                    key
+                )
                 return
             }
 
-            guard action.kind != .none && action.kind != .voiceInput else { return }
+            guard action.kind != .none else { return }
+            let summary = library.description(for: action)
             runner.enqueueMappedAction(
                 action,
                 label: "实体\(key.title) · \(gesture.title)",
                 library: library
             )
+            self.onActionFeedback?("已触发「\(key.title) · \(gesture.title)」：\(summary)", key)
         }
     }
 
@@ -288,6 +341,7 @@ final class RemoteSessionCoordinator {
         guard let lanRelay else { return }
 
         lanRelay.onReleaseLocalHoldsBeforeSwitch = { [weak self] in
+            self?.voiceStateMachine.reset()
             self?.actionRunner?.cancelPendingMappedActions()
             self?.actionRunner?.endMappedShortcutHold()
             self?.actionRunner?.endVoiceShortcutHold()
@@ -299,14 +353,25 @@ final class RemoteSessionCoordinator {
                   let store = self.mappingStore,
                   let library = self.actionLibrary,
                   let relay = self.lanRelay else { return nil }
-            return store.exportSyncSnapshot(peerName: relay.localPeerName, library: library)
+            return store.exportSyncSnapshot(
+                peerName: relay.localPeerName,
+                library: library,
+                learnedHIDProfile: self.hidCapture?.exportLearnedProfile()
+            )
         }
 
         lanRelay.onApplySyncedConfig = { [weak self] snapshot, strategy in
             guard let self,
                   let store = self.mappingStore,
                   let library = self.actionLibrary else { return nil }
-            let result = store.applySyncedSnapshot(snapshot, strategy: strategy, library: library)
+            let result = store.applySyncedSnapshot(
+                snapshot,
+                strategy: strategy,
+                library: library,
+                onRestoreHIDProfile: { [weak self] profile in
+                    self?.hidCapture?.applyImportedLearnedProfile(profile) ?? 0
+                }
+            )
             if self.lanRelay?.suppressPromptWindowsForTesting != true {
                 RemoteSwitchHUDController.shared.show(
                     title: strategy == .merge ? "已完成合并同步" : "已完成覆盖同步",
@@ -327,17 +392,20 @@ final class RemoteSessionCoordinator {
             let label = "局域网远端 · \(key.title)（\(gesture.title)）"
             if mode == .receiverMapping {
                 let localAction = store.action(for: key, gesture: gesture)
-                guard localAction.kind != .none && localAction.kind != .voiceInput else { return }
+                guard localAction.kind != .none else { return }
                 runner.enqueueMappedAction(localAction, label: label, library: library)
+                self.onActionFeedback?("收到远端「\(key.title)」→ \(library.description(for: localAction))", key)
                 return
             }
 
             if let systemAction, systemAction != .switchMacTarget {
                 let action = RemoteAction(kind: .systemAction, systemAction: systemAction)
                 runner.enqueueMappedAction(action, label: label, library: library)
+                self.onActionFeedback?("收到远端「\(key.title)」→ \(systemAction.title)", key)
             } else if let forwardedSteps, !forwardedSteps.isEmpty {
                 let steps = forwardedSteps.map { $0.toActionStep() }
                 runner.enqueueForwardedSteps(steps, label: label, library: library)
+                self.onActionFeedback?("收到远端多步动作「\(key.title)」", key)
             } else if let shortcut {
                 let action = RemoteAction(
                     kind: .keyboardShortcut,
@@ -345,6 +413,7 @@ final class RemoteSessionCoordinator {
                     outputHoldSeconds: holdSeconds
                 )
                 runner.enqueueMappedAction(action, label: label, library: library)
+                self.onActionFeedback?("收到远端「\(key.title)」→ \(shortcut.display)", key)
             }
         }
 
@@ -358,7 +427,7 @@ final class RemoteSessionCoordinator {
                     _ = runner.beginMappedShortcutHold(localHoldShortcut, for: key)
                 } else {
                     let localLongPress = store.action(for: key, gesture: .longPress)
-                    if localLongPress.kind != .none && localLongPress.kind != .voiceInput {
+                    if localLongPress.kind != .none {
                         runner.enqueueMappedAction(
                             localLongPress,
                             label: "局域网远端 · \(key.title)（长按）",
@@ -396,8 +465,13 @@ final class RemoteSessionCoordinator {
                 : (senderShortcut ?? localShortcut)
             let trigger = mode == .receiverMapping ? monitor.doubaoShortcutTrigger : senderTrigger
 
+            self.voiceStateMachine.beginIncomingRemoteSession(
+                hasVirtualMic: hasVirtualMic,
+                hasTargetShortcut: targetShortcut != nil,
+                trigger: trigger
+            )
+
             if hasVirtualMic, let targetShortcut {
-                self.incomingVoiceUsedVirtualMicShortcut = true
                 bluetooth.virtualMicrophone.prepareVoiceInputWindow()
                 bluetooth.virtualMicrophone.beginSession(sourceRate: sampleRate)
                 switch trigger {
@@ -407,7 +481,6 @@ final class RemoteSessionCoordinator {
                     runner.beginVoiceShortcutHold(targetShortcut)
                 }
             } else {
-                self.incomingVoiceUsedVirtualMicShortcut = false
                 bluetooth.virtualMicrophone.engageSpeakerEchoSuppression()
                 if hasVirtualMic {
                     bluetooth.virtualMicrophone.beginSession(sourceRate: sampleRate)
@@ -433,39 +506,47 @@ final class RemoteSessionCoordinator {
 
         lanRelay.onIncomingVoiceEnd = { [weak self] in
             guard let self, let bluetooth = self.bluetooth else { return }
-            self.actionRunner?.endVoiceShortcutHold()
-            bluetooth.virtualMicrophone.endSessionGracefully()
-            bluetooth.virtualMicrophone.scheduleVoiceInputRestoration()
-            bluetooth.endRemoteIncomingVoice()
+            let effect = self.voiceStateMachine.endIncomingRemoteSession(
+                recordedSamples: bluetooth.recordedSampleCount
+            )
+            if case .finishIncomingRemoteVoice(let releaseHold, let drainMic, let shouldTranscribe) = effect {
+                if releaseHold {
+                    self.actionRunner?.endVoiceShortcutHold()
+                }
+                if drainMic {
+                    bluetooth.virtualMicrophone.endSessionGracefully()
+                }
+                bluetooth.virtualMicrophone.scheduleVoiceInputRestoration()
+                bluetooth.endRemoteIncomingVoice()
 
-            if !self.incomingVoiceUsedVirtualMicShortcut,
-               bluetooth.recordedSampleCount > 1_200,
-               let wav = bluetooth.waveFileData(),
-               let transcriber = self.transcriber {
-                transcriber.recognize(
-                    waveData: wav,
-                    onFinalTranscript: { [weak self] recognizedText in
-                        self?.actionRunner?.insertRecognizedText(recognizedText)
-                        if self?.lanRelay?.suppressPromptWindowsForTesting != true {
-                            RemoteSwitchHUDController.shared.show(
-                                title: "远端语音已识别输入",
-                                subtitle: recognizedText,
-                                symbol: "checkmark.bubble.fill",
-                                tint: RemotePalette.positive
-                            )
+                if shouldTranscribe,
+                   let wav = bluetooth.waveFileData(),
+                   let transcriber = self.transcriber {
+                    transcriber.recognize(
+                        waveData: wav,
+                        onFinalTranscript: { [weak self] recognizedText in
+                            self?.actionRunner?.insertRecognizedText(recognizedText)
+                            if self?.lanRelay?.suppressPromptWindowsForTesting != true {
+                                RemoteSwitchHUDController.shared.show(
+                                    title: "远端语音已识别输入",
+                                    subtitle: recognizedText,
+                                    symbol: "checkmark.bubble.fill",
+                                    tint: RemotePalette.positive
+                                )
+                            }
+                        },
+                        onFailure: { [weak self] reason in
+                            if self?.lanRelay?.suppressPromptWindowsForTesting != true {
+                                RemoteSwitchHUDController.shared.show(
+                                    title: "远端语音已接收（未自动上屏）",
+                                    subtitle: reason,
+                                    symbol: "exclamationmark.bubble.fill",
+                                    tint: RemotePalette.amber
+                                )
+                            }
                         }
-                    },
-                    onFailure: { [weak self] reason in
-                        if self?.lanRelay?.suppressPromptWindowsForTesting != true {
-                            RemoteSwitchHUDController.shared.show(
-                                title: "远端语音已接收（未自动上屏）",
-                                subtitle: reason,
-                                symbol: "exclamationmark.bubble.fill",
-                                tint: RemotePalette.amber
-                            )
-                        }
-                    }
-                )
+                    )
+                }
             }
         }
     }

@@ -5,7 +5,6 @@ import IOKit.hid
 enum HIDCaptureKind: String {
     case value = "VALUE"
     case report = "REPORT"
-    case ble = "BLE"
     case atvv = "ATVV"
     case system = "SYSTEM"
 }
@@ -21,14 +20,6 @@ enum RemoteHIDImportError: LocalizedError {
         case .unsupportedDevice:
             "导入文件未标明可识别的遥控器型号，已拒绝。"
         }
-    }
-
-}
-
-enum RemoteHIDExportError: LocalizedError {
-    case noDevice
-    var errorDescription: String? {
-        "未记录可验证的遥控器型号，请先在本机成功独占一次实体 HID 设备再导出。"
     }
 }
 
@@ -52,10 +43,8 @@ struct HIDCaptureEntry: Identifiable {
             return "[\(timestamp)] VALUE page=\(Self.hex(usagePage)) usage=\(Self.hex(usage)) value=\(value ?? 0) report=\(reportID ?? 0)\(tagged)"
         case .report:
             return "[\(timestamp)] REPORT id=\(reportID ?? 0) bytes=\(rawHex ?? "")\(tagged)"
-        case .ble:
-            return "[\(timestamp)] BLE HID \(note) bytes=\(rawHex ?? "")\(tagged) [非独占]"
         case .atvv:
-            return "[\(timestamp)] ATVV CTL bytes=\(rawHex ?? "")\(tagged) [仅语音控制]"
+            return "[\(timestamp)] ATVV CTL bytes=\(rawHex ?? "")\(tagged) [语音控制]"
         case .system:
             return "[\(timestamp)] SYSTEM \(note)"
         }
@@ -66,14 +55,14 @@ struct HIDCaptureEntry: Identifiable {
     }
 }
 
-/// Exclusive listener for ONE verified Google remote HID interface. Automatic
-/// startup interception is user-configurable and does not seize normal keyboards.
+/// Exclusive listener for ONE verified remote HID interface.
+/// Defaults to immediate action execution once macOS permissions are granted,
+/// eliminating the newcomer trap where paired remotes only flashed UI previews.
 @MainActor
 final class HIDCaptureManager: ObservableObject {
     @Published private(set) var isCapturing = false
     @Published private(set) var isExclusive = false
     @Published private(set) var status = "尚未启动监听"
-    @Published private(set) var remainingSeconds = 90
     @Published private(set) var events: [HIDCaptureEntry] = []
     @Published private(set) var sampledKeys: Set<RemoteKey> = []
     @Published var expectedKey: RemoteKey = .up
@@ -93,7 +82,6 @@ final class HIDCaptureManager: ObservableObject {
     @Published private(set) var highlightedPhysicalKey: RemoteKey?
     @Published private(set) var lastHardwareFeedback = "等待实体遥控器按键"
     @Published private(set) var hardwareEventSequence = 0
-    @Published private(set) var isAutomaticCapture = false
     @Published var autoSeizeEnabled: Bool {
         didSet { UserDefaults.standard.set(autoSeizeEnabled, forKey: Self.autoKey) }
     }
@@ -109,13 +97,12 @@ final class HIDCaptureManager: ObservableObject {
     @Published var doubaoShortcutTrigger: DoubaoShortcutTrigger {
         didSet { UserDefaults.standard.set(doubaoShortcutTrigger.rawValue, forKey: Self.doubaoTriggerKey) }
     }
+
     var onMappedGesture: ((RemoteKey, RemoteGesture) -> Void)?
     var onAbortMappedActions: (() -> Void)?
-    /// Long-press mappings may opt in to a target key held until physical release.
     var shouldFollowPhysicalHold: ((RemoteKey) -> Bool)?
     var onMappedHoldStart: ((RemoteKey) -> Bool)?
     var onMappedHoldEnd: ((RemoteKey) -> Void)?
-    /// ATVV mic requests have start/stop semantics, not HID key-up timing.
     var onVoiceSessionStart: (() -> Void)?
     var onVoiceSessionEnd: (() -> Void)?
     private var atvvVoiceActive = false
@@ -123,9 +110,7 @@ final class HIDCaptureManager: ObservableObject {
 
     private var device: IOHIDDevice?
     private var buffer: UnsafeMutablePointer<UInt8>?
-    private var timerTask: Task<Void, Never>?
     private let reportBufferSize = 512
-    private let captureDuration = 90
     private var currentPress: (code: RemoteHIDButtonCode, started: Date)?
     private var xiaomiPresses: [RemoteKey: Date] = [:]
     private var xiaomiLearningPresses: Set<RemoteKey> = []
@@ -134,7 +119,7 @@ final class HIDCaptureManager: ObservableObject {
     private var flashTask: Task<Void, Never>?
     private var suppressNextRelease = false
     private static let autoKey = "GoogleRemote.autoSeizeOnLaunch.v1"
-    private static let actionsKey = "GoogleRemote.executeHardwareActions.v1"
+    private static let actionsKey = "MoteFlow.executeHardwareActions.v2"
     private static let doubaoTriggerKey = "GoogleRemote.doubaoShortcutTrigger.v1"
     private static let learnedKey = "GoogleRemote.learnedHardwareCodes.v1"
     private static let deviceIdentityKey = "GoogleRemote.learnedDeviceIdentity.v1"
@@ -147,10 +132,9 @@ final class HIDCaptureManager: ObservableObject {
     private var currentRemoteFingerprint: String?
 
     init() {
-        // User explicitly requested automatic interception after matching the
-        // physical Google remote. Action execution still requires a separate opt-in.
         autoSeizeEnabled = UserDefaults.standard.object(forKey: Self.autoKey) as? Bool ?? true
-        executeHardwareActions = UserDefaults.standard.bool(forKey: Self.actionsKey)
+        // Default to true on fresh installs & upgrades so connected remotes work out of the box!
+        executeHardwareActions = UserDefaults.standard.object(forKey: Self.actionsKey) as? Bool ?? true
         doubaoShortcutTrigger = DoubaoShortcutTrigger(
             rawValue: UserDefaults.standard.string(forKey: Self.doubaoTriggerKey) ?? ""
         ) ?? .hold
@@ -158,11 +142,24 @@ final class HIDCaptureManager: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: Self.learnedKey),
            let restored = try? JSONDecoder().decode([RemoteKey: RemoteHIDButtonCode].self, from: data) {
             userLearnedCodes = restored
-            // Do not claim these codes are usable until the actual opened HID
-            // device matches the stored model.
         }
         if let data = UserDefaults.standard.data(forKey: Self.deviceIdentityKey) {
             lastLearnedDeviceIdentity = try? JSONDecoder().decode(RemoteHIDDeviceIdentity.self, from: data)
+        }
+    }
+
+    /// Unified master control state for menu bar & top header.
+    var isRemoteControlActive: Bool {
+        autoSeizeEnabled && executeHardwareActions
+    }
+
+    func setRemoteControlActive(_ active: Bool) {
+        if active {
+            executeHardwareActions = true
+            enableAutomaticCapture()
+        } else {
+            executeHardwareActions = false
+            disableAutomaticCapture()
         }
     }
 
@@ -170,7 +167,7 @@ final class HIDCaptureManager: ObservableObject {
     var latest: HIDCaptureEntry? { events.last(where: { $0.kind != .system }) }
 
     /// Safe, bounded periodic discovery. On startup/reconnect, only seize when
-    /// an unambiguous verified Google remote HID candidate exists.
+    /// an unambiguous verified remote HID candidate exists.
     func tryAutomaticCapture() {
         guard autoSeizeEnabled, !isCapturing,
               Date().timeIntervalSince(lastAttempt) >= 4 else { return }
@@ -200,12 +197,12 @@ final class HIDCaptureManager: ObservableObject {
             status = eligible.isEmpty ? "等待已配对的遥控器 HID 接口" : "存在多个遥控器接口，请在诊断中指定设备"
             return
         }
-        startSeizedCapture(of: selected, persistent: true)
+        startSeizedCapture(of: selected)
     }
 
     func disableAutomaticCapture() {
         autoSeizeEnabled = false
-        stop(reason: "用户暂停自动拦截；HID 已释放")
+        stop(reason: "已暂停遥控器接管；HID 已释放")
     }
 
     func enableAutomaticCapture() {
@@ -215,7 +212,6 @@ final class HIDCaptureManager: ObservableObject {
     }
 
     func forgetLearnedKey(_ key: RemoteKey) {
-        guard advancedLearningEnabled else { return }
         userLearnedCodes.removeValue(forKey: key)
         persistLearnedCodes()
         updateEffectiveCodes()
@@ -249,50 +245,51 @@ final class HIDCaptureManager: ObservableObject {
             UserDefaults.standard.string(forKey: Self.learnedDeviceKey) == currentRemoteFingerprint
     }
 
-    var exportableLearnedCount: Int { userLearnedCodes.count }
-
-    func exportLearnedProfileData() throws -> Data {
-        guard let device = currentDeviceIdentity ?? lastLearnedDeviceIdentity else {
-            throw RemoteHIDExportError.noDevice
+    /// Exports custom learned HID codes for inclusion in the unified full-config backup JSON.
+    func exportLearnedProfile() -> RemoteHIDProfile? {
+        guard !userLearnedCodes.isEmpty,
+              let device = currentDeviceIdentity ?? lastLearnedDeviceIdentity else {
+            return nil
         }
-        // The export contains only independently sampled user mappings,
-        // never unverified factory placeholders or remembered UI labels.
         let profile = RemoteHIDProfile(device: device, codes: userLearnedCodes)
-        return try profile.exportData()
+        return (try? profile.validatedCodes()) != nil ? profile : nil
     }
 
-    /// Restore a JSON backup without ever importing executable actions or
-    /// granting access to another HID device. A profile is only used when
-    /// its exact model matches the actual device opened by IOKit.
-    func importUserProfileData(_ data: Data) throws {
-        let profile = try RemoteHIDProfile.importData(data)
+    /// Applies custom learned HID codes bundled inside an imported backup JSON.
+    @discardableResult
+    func applyImportedLearnedProfile(_ profile: RemoteHIDProfile) -> Int {
         let device = profile.device
         guard RemoteDeviceProfileRegistry.identify(
-            vendorID: device.vendorID, productID: device.productID,
+            vendorID: device.vendorID,
+            productID: device.productID,
             productName: device.productName
-        ) != nil else {
-            throw RemoteHIDImportError.unsupportedDevice
+        ) != nil,
+              let validated = try? profile.validatedCodes(),
+              !validated.isEmpty else {
+            return 0
         }
         if let currentDeviceIdentity, !device.matches(currentDeviceIdentity) {
-            throw RemoteHIDImportError.wrongConnectedDevice
+            return 0
         }
-        userLearnedCodes = try profile.validatedCodes()
+        userLearnedCodes = validated
         let fingerprint = "\(device.vendorID):\(device.productID):\(device.productName)"
         UserDefaults.standard.set(fingerprint, forKey: Self.learnedDeviceKey)
         lastLearnedDeviceIdentity = device
-        UserDefaults.standard.set(try JSONEncoder().encode(device), forKey: Self.deviceIdentityKey)
+        if let encoded = try? JSONEncoder().encode(device) {
+            UserDefaults.standard.set(encoded, forKey: Self.deviceIdentityKey)
+        }
         persistLearnedCodes()
         updateEffectiveCodes()
+        return validated.count
     }
 
     func clearUserOverrides() {
-        guard advancedLearningEnabled else { return }
         userLearnedCodes.removeAll()
         persistLearnedCodes()
         updateEffectiveCodes()
     }
 
-    func startSeizedCapture(of candidate: HIDRemoteCandidate, persistent: Bool = false) {
+    func startSeizedCapture(of candidate: HIDRemoteCandidate) {
         guard !isCapturing else { return }
         guard SystemHIDProbe.inputMonitoringGranted else {
             status = "macOS「输入监控」权限未授权；不能打开 HID 接口"
@@ -323,7 +320,6 @@ final class HIDCaptureManager: ObservableObject {
             return
         }
 
-        // Check again immediately before opening; do not trust a stale UI selection.
         let name = IOHIDDeviceGetProperty(selectedDevice, kIOHIDProductKey as CFString) as? String ?? ""
         let vendor = (IOHIDDeviceGetProperty(selectedDevice, kIOHIDVendorIDKey as CFString) as? NSNumber)?.intValue ?? 0
         let product = (IOHIDDeviceGetProperty(selectedDevice, kIOHIDProductIDKey as CFString) as? NSNumber)?.intValue ?? 0
@@ -338,8 +334,6 @@ final class HIDCaptureManager: ObservableObject {
 
         let result = IOHIDDeviceOpen(selectedDevice, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
         guard result == kIOReturnSuccess else {
-            // Never silently fall back to passive monitoring: the user's first
-            // requirement is that remote keypresses do not reach macOS.
             status = "独占失败 \(Self.errorCode(result))；未开始监听，系统仍可能响应按键"
             appendSystem(status)
             return
@@ -386,37 +380,18 @@ final class HIDCaptureManager: ObservableObject {
         }, context)
         IOHIDDeviceScheduleWithRunLoop(selectedDevice, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
-        remainingSeconds = captureDuration
-        isAutomaticCapture = persistent
         isExclusive = true
         isCapturing = true
-        status = persistent ? "\(name) 自动独占中 · 可在诊断或菜单栏停止" : "临时独占中 · 90 秒后自动释放"
-        appendSystem("独占成功：\(name) VID=\(String(format: "%04X", vendor)) PID=\(String(format: "%04X", product))；仅选定接口")
+        status = "\(name) 独占接管中"
+        appendSystem("独占成功：\(name) VID=\(String(format: "%04X", vendor)) PID=\(String(format: "%04X", product))")
         UserDefaults.standard.set(vendor, forKey: Self.lastVendorKey)
         UserDefaults.standard.set(product, forKey: Self.lastProductKey)
         UserDefaults.standard.set(candidate.id, forKey: Self.lastInterfaceKey)
-
-        timerTask?.cancel()
-        let duration = captureDuration
-        if !persistent {
-            timerTask = Task { [weak self] in
-                for _ in 0..<duration {
-                    try? await Task.sleep(for: .seconds(1))
-                    guard !Task.isCancelled, let self, self.isCapturing else { return }
-                    self.remainingSeconds -= 1
-                }
-                self?.stop(reason: "90 秒时间到，已自动释放 HID 独占")
-            }
-        } else {
-            remainingSeconds = 0
-        }
     }
 
-    func stop(reason: String = "用户结束监听，HID 独占已释放") {
+    func stop(reason: String = "已停止监听，HID 独占已释放") {
         onAbortMappedActions?()
         cancelAllLiveHolds()
-        timerTask?.cancel()
-        timerTask = nil
         var releaseFailure: String?
         if let device {
             IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
@@ -436,7 +411,6 @@ final class HIDCaptureManager: ObservableObject {
         flashTask?.cancel()
         flashTask = nil
         learningKey = nil
-        isAutomaticCapture = false
         if let buffer {
             buffer.deinitialize(count: reportBufferSize)
             buffer.deallocate()
@@ -445,50 +419,33 @@ final class HIDCaptureManager: ObservableObject {
         guard isCapturing else { return }
         isCapturing = false
         isExclusive = false
-        remainingSeconds = 0
         status = releaseFailure ?? reason
         appendSystem(status)
     }
 
     func clearLogs() {
         events.removeAll()
-        // Clearing logs must not silently erase the durable learned mappings.
     }
 
     func exportText() -> String {
         events.map(\.line).joined(separator: "\n")
     }
 
-    func recordBLEReport(characteristic: String, data: Data) {
-        let hex = data.prefix(64).map { String(format: "%02X", $0) }.joined(separator: " ")
-        append(HIDCaptureEntry(
-            kind: .ble, expectedKey: expectedKey, usagePage: nil, usage: nil, value: nil,
-            reportID: nil, rawHex: hex, note: "char=\(characteristic)"
-        ))
-        // BLE diagnostics must not falsely mark a button as physically
-        // learned: only an explicit HID learning session can do that.
-    }
-
     func recordATVVControl(_ data: Data) {
         let bytes = [UInt8](data)
         guard let opcode = bytes.first else { return }
-        // Ignore capability negotiation and stream maintenance, keep only
-        // speech button start/stop and audio lifecycle diagnostics.
         guard [0x00, 0x04, 0x08, 0x0A].contains(opcode) else { return }
         let hex = bytes.prefix(32).map { String(format: "%02X", $0) }.joined(separator: " ")
         append(HIDCaptureEntry(
             kind: .atvv, expectedKey: expectedKey, usagePage: nil, usage: nil, value: nil,
             reportID: nil, rawHex: hex, note: "语音控制信号"
         ))
-        // ATVV 0x08 requests a microphone session; it is not necessarily a
-        // physical key-up/down pair. The session ends only on ATVV mic-close,
-        // audio completion or disconnect, NOT after a fixed amount of time.
         if opcode == 0x08 {
             if learningKey == .assistant {
                 learningKey = nil
             }
             hardwareEventSequence += 1
-            lastHardwareFeedback = "实体语音助手 · ATVV 麦克风请求已收到（非 HID 按键）"
+            lastHardwareFeedback = "实体语音助手 · ATVV 麦克风请求已收到"
             flashPhysicalKey(.assistant)
             if !atvvVoiceActive {
                 atvvVoiceActive = true
@@ -517,8 +474,6 @@ final class HIDCaptureManager: ObservableObject {
             reportID: Int(IOHIDElementGetReportID(element)),
             rawHex: nil, note: ""
         ))
-        // Xiaomi RC001/RC003 may publish standard key/consumer usage values.
-        // This path is isolated from Google's verified 2-byte report decoder.
         if let identity = currentDeviceIdentity,
            let model = RemoteDeviceProfileRegistry.identify(
                 vendorID: identity.vendorID,
@@ -549,8 +504,6 @@ final class HIDCaptureManager: ObservableObject {
                 scheduleLiveHold(for: key)
             }
             if key == .assistant && !atvvVoiceActive {
-                // Some Xiaomi firmware reports microphone as F5 HID, others
-                // also send an ATVV mic-start. Share a single session gate.
                 atvvVoiceActive = true
                 if executeHardwareActions { onVoiceSessionStart?() }
             }
@@ -623,17 +576,15 @@ final class HIDCaptureManager: ObservableObject {
                 suppressNextRelease = false
             } else if completePhysicalHoldIfNeeded(for: pressedKey, gesture: gesture,
                                                     started: liveHoldWasStarted) {
-                // The live hold has already been controlled by key-down/up.
+                // Live hold completed.
             } else if learningKey == nil && executeHardwareActions {
                 onMappedGesture?(pressedKey, gesture)
             }
             return
         }
-        // Ignore held-key auto repeats; send at most one action when released.
         if currentPress?.code == signal { return }
         if let oldPress = currentPress,
            let oldKey = learnedCodes.first(where: { $0.value == oldPress.code })?.key {
-            // Lost release or a different HID code replaced the held key.
             endLiveHold(for: oldKey)
         }
         currentPress = (signal, Date())
@@ -698,8 +649,6 @@ final class HIDCaptureManager: ObservableObject {
     private func completePhysicalHoldIfNeeded(for key: RemoteKey, gesture: RemoteGesture,
                                                started: Bool) -> Bool {
         guard gesture == .longPress, shouldFollowPhysicalHold?(key) == true else { return false }
-        // A very short scheduling delay on a busy main loop can put key-up
-        // just ahead of the threshold task. Still send one valid down/up pair.
         if !started && executeHardwareActions && learningKey == nil,
            onMappedHoldStart?(key) == true {
             onMappedHoldEnd?(key)

@@ -7,7 +7,6 @@ import Foundation
 enum RemoteExecutionError: LocalizedError {
     case nothingConfigured
     case missingKey
-    case missingScript
     case invalidScript
     case accessibilityDenied
     case cannotCreateKeyboardEvent
@@ -22,7 +21,6 @@ enum RemoteExecutionError: LocalizedError {
         switch self {
         case .nothingConfigured: "尚未设置可执行的动作"
         case .missingKey: "尚未录制目标按键"
-        case .missingScript: "尚未选择本地脚本"
         case .invalidScript: "脚本文件已不存在，或不是支持的 .sh / .zsh / .command / .py 文件"
         case .accessibilityDenied: "macOS 未授权「辅助功能」，无法模拟键盘输入。已发起系统授权请求。"
         case .cannotCreateKeyboardEvent: "无法生成 macOS 键盘事件"
@@ -38,13 +36,9 @@ enum RemoteExecutionError: LocalizedError {
 
 @MainActor
 private enum RemoteSystemActionExecutor {
-    /// Screenshots are handled by macOS itself. No CGEvent shortcuts are
-    /// generated, so the user may remap screenshot shortcuts freely.
     static func executeSystemAction(_ action: RemoteSystemAction) async throws {
         for (index, step) in action.executionSequence.enumerated() {
             try executeSingleAction(step)
-            // Give the frontmost app a chance to apply Select All before Copy
-            // or Paste, especially in web-based text editors.
             if index + 1 < action.executionSequence.count {
                 try await Task.sleep(for: .milliseconds(100))
             }
@@ -67,11 +61,6 @@ private enum RemoteSystemActionExecutor {
         try performFrontmostMenuAction(action)
     }
 
-    /// There is no public cross-application Copy/Paste command. Query the
-    /// frontmost app's accessible Edit menu *without opening it* and directly
-    /// invoke the matching menu item. Never AXPress the parent menu-bar item:
-    /// doing so visibly drops down the menu on every remote click.
-    /// Unsupported menu trees fail without flashing a menu or guessing keys.
     private static func performFrontmostMenuAction(_ action: RemoteSystemAction) throws {
         guard action.usesAccessibilityMenu,
               let frontmost = NSWorkspace.shared.frontmostApplication,
@@ -99,9 +88,6 @@ private enum RemoteSystemActionExecutor {
         }) else {
             throw RemoteExecutionError.systemActionUnavailable("当前应用未提供可访问的「编辑」菜单")
         }
-        // A closed menu's children are generally exposed through AX even when
-        // the menu is not on screen. Opening the "Edit" menu here would cause
-        // an ugly visual flash for every Copy/Paste or composite long-press.
         let children = Self.axChildren(edit).flatMap { Self.axChildren($0) }
         let direct = Self.axChildren(edit)
         let items = children.isEmpty ? direct : children
@@ -113,7 +99,7 @@ private enum RemoteSystemActionExecutor {
             }
         }) else {
             throw RemoteExecutionError.systemActionUnavailable(
-                "无法静默读取当前应用的「\(action.title)」菜单命令；该应用可能不支持在菜单关闭时读取"
+                "无法静默读取当前应用的「\(action.title)」菜单命令"
             )
         }
         var enabledValue: CFTypeRef?
@@ -143,11 +129,8 @@ private enum RemoteSystemActionExecutor {
         ) == .success else { return "" }
         return (value as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     }
-
 }
 
-/// Executes only after explicit user confirmation. Real remote dispatch
-/// remains disabled until the HID press/release protocol is actually verified.
 @MainActor
 final class RemoteActionRunner: ObservableObject {
     @Published private(set) var running = false
@@ -170,9 +153,6 @@ final class RemoteActionRunner: ObservableObject {
         return flags
     }
 
-    /// A standalone Command/Option/Control/Shift must be emitted as a
-    /// flagsChanged transition; keyDown on virtual key 55 is not a genuine
-    /// left-Command press as far as many global-hotkey listeners are concerned.
     private static func configureMainKeyEvents(
         _ down: CGEvent, _ up: CGEvent, shortcut: RemoteShortcut
     ) {
@@ -202,8 +182,6 @@ final class RemoteActionRunner: ObservableObject {
         return flags
     }
 
-    /// Physical modifier events are necessary: setting .maskAlternate alone
-    /// does not identify left vs right Option for system-wide hotkeys.
     private static func postPhysicalModifiers(_ shortcut: RemoteShortcut, pressing: Bool) {
         let codes = shortcut.pressedModifierKeyCodes
         var down: Set<UInt16> = pressing ? [] : Set(codes)
@@ -244,8 +222,6 @@ final class RemoteActionRunner: ObservableObject {
         _ = running.activate()
     }
 
-    /// Doubao's configurable hold-to-dictate hotkey. This controls Doubao
-    /// reading its OWN selected macOS microphone; it does not route ATVV PCM.
     func beginVoiceShortcutHold(_ shortcut: RemoteShortcut) {
         guard !voiceShortcutHeld && !running && mappedHold == nil else { return }
         guard CGPreflightPostEventAccess() else {
@@ -262,7 +238,7 @@ final class RemoteActionRunner: ObservableObject {
         voiceKeyUp = up
         heldVoiceShortcut = shortcut
         voiceShortcutHeld = true
-        result = "正在按住豆包快捷键 \(shortcut.display)；将随 ATVV 会话结束释放，而非固定秒数"
+        result = "正在按住豆包快捷键 \(shortcut.display)；将随 ATVV 会话结束释放"
         Self.postPhysicalModifiers(shortcut, pressing: true)
         down.post(tap: .cghidEventTap)
     }
@@ -279,8 +255,6 @@ final class RemoteActionRunner: ObservableObject {
         result = "豆包快捷键已释放；等待豆包完成听写并输入到当前文本框"
     }
 
-    /// This is an actual key-down/key-up pair, not a timer-based key press.
-    /// HID key-up (or capture shutdown) is responsible for releasing it.
     @discardableResult
     func beginMappedShortcutHold(_ shortcut: RemoteShortcut, for key: RemoteKey) -> Bool {
         guard mappedHold == nil, !running, !voiceShortcutHeld else {
@@ -305,8 +279,6 @@ final class RemoteActionRunner: ObservableObject {
         down.post(tap: .cghidEventTap)
         result = "实体「\(key.title)」正在按住 \(shortcut.display)，松开遥控器即释放"
         startMappedKeyRepeat(shortcut, for: holdID)
-        // Failsafe only: if the remote never reports key-up, do not leave a
-        // key logically down forever. Ordinary releases have no fixed duration.
         mappedHoldWatchdog?.cancel()
         mappedHoldWatchdog = Task { [weak self] in
             try? await Task.sleep(for: .seconds(120))
@@ -318,7 +290,6 @@ final class RemoteActionRunner: ObservableObject {
 
     func endMappedShortcutHold(for key: RemoteKey? = nil) {
         guard let held = mappedHold, key == nil || held.key == key else { return }
-        // Cancel before keyUp so no repeat can be emitted after release.
         mappedRepeatTask?.cancel()
         mappedRepeatTask = nil
         mappedHoldWatchdog?.cancel()
@@ -330,9 +301,6 @@ final class RemoteActionRunner: ObservableObject {
         drainMappedActions()
     }
 
-    /// Synthetic CGEvent keyDown is not auto-repeated by macOS. Post explicit
-    /// keyDown events marked as repeats, using the user's keyboard repeat
-    /// preferences, until the physical remote sends key-up.
     private func startMappedKeyRepeat(_ shortcut: RemoteShortcut, for holdID: UUID) {
         mappedRepeatTask?.cancel()
         mappedRepeatTask = nil
@@ -357,8 +325,6 @@ final class RemoteActionRunner: ObservableObject {
         }
     }
 
-    /// HID releases can arrive much faster than the macOS key-up timer.
-    /// Never discard a short tap because a previous mapped action is running.
     func enqueueMappedAction(_ action: RemoteAction, label: String, library: RemoteLibraryStore) {
         guard pendingMappedActions.count < 24 else {
             result = "连续按键过多，已限制待执行动作队列"
@@ -385,21 +351,18 @@ final class RemoteActionRunner: ObservableObject {
         test(action: next.action, label: next.label, library: next.library, inlineSteps: next.inlineSteps)
     }
 
-    /// One short key down/up pair. No held state remains after the tap.
     func tapVoiceShortcut(_ shortcut: RemoteShortcut) {
         guard !running && !voiceShortcutHeld && mappedHold == nil else { return }
         Task {
             do {
                 try await emitKeyboard(shortcut, holdSeconds: 0.08)
-                result = "已单击豆包快捷键 \(shortcut.display)；录音是否开始由豆包的单击模式决定"
+                result = "已单击豆包快捷键 \(shortcut.display)"
             } catch {
                 result = "豆包快捷键单击失败：\(error.localizedDescription)"
             }
         }
     }
 
-    /// Inserts offline-transcribed speech text at the current cursor when the
-    /// receiving Mac does not have BlackHole 2ch installed, preserving clipboard text.
     func insertRecognizedText(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -414,7 +377,7 @@ final class RemoteActionRunner: ObservableObject {
         }
 
         let pasteShortcut = RemoteShortcut(
-            keyCode: 9, // 'V'
+            keyCode: 9,
             keyLabel: "V",
             command: true,
             shift: false,
@@ -445,9 +408,7 @@ final class RemoteActionRunner: ObservableObject {
 
         Task {
             do {
-                if action.kind == .voiceInput {
-                    result = "语音动作尚需实体遥控器 ATVV 验证，未执行"
-                } else if action.kind == .systemAction {
+                if action.kind == .systemAction {
                     guard let native = action.systemAction else {
                         throw RemoteExecutionError.systemActionUnavailable("未选择系统动作")
                     }
@@ -498,7 +459,6 @@ final class RemoteActionRunner: ObservableObject {
         Self.configureMainKeyEvents(down, up, shortcut: shortcut)
         Self.postPhysicalModifiers(shortcut, pressing: true)
         down.post(tap: .cghidEventTap)
-        // Always release both main key and physical modifiers on cancellation.
         defer {
             up.post(tap: .cghidEventTap)
             Self.postPhysicalModifiers(shortcut, pressing: false)
@@ -539,7 +499,6 @@ final class RemoteActionRunner: ObservableObject {
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: language.executable)
-        // Script path is a single argv value; never interpolate it into a shell command.
         process.arguments = [path]
         process.currentDirectoryURL = url.deletingLastPathComponent()
         process.standardInput = FileHandle.nullDevice

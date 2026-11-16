@@ -5,9 +5,9 @@ import Network
 
 /// Coordinates Dual-Mac same-port TCP connection, 6-digit click-to-confirm
 /// pairing, mutual HMAC-SHA256 trust authentication, automatic reconnection
-/// strictly limited to paired trusted peers, bidirectional mapping-follow mode
-/// & one-click configuration sync (merge / overwrite), target switching with
-/// macOS system notifications, and real-time action/hold/PCM forwarding.
+/// (delegated to `RemoteLANTrustStore`), bidirectional mapping-follow mode,
+/// one-click config sync, and real-time action/hold/PCM forwarding.
+/// Uses the zero-permission translucent top HUD capsule + subtle sound for switch feedback.
 @MainActor
 final class RemoteLANRelayManager: ObservableObject {
     @Published var isServiceEnabled: Bool {
@@ -29,7 +29,8 @@ final class RemoteLANRelayManager: ObservableObject {
         didSet {
             defaults.set(autoConnectTrustedPeer, forKey: Self.autoConnectKey)
             if autoConnectTrustedPeer {
-                pausedAutoConnectPeerIDs.removeAll()
+                trustStore.clearAllSessionPauses()
+                syncTrustPublishedState()
                 scheduleAutoConnectCheck()
             } else {
                 autoConnectDebounceTask?.cancel()
@@ -47,14 +48,6 @@ final class RemoteLANRelayManager: ObservableObject {
     }
     @Published var switchHUDEnabled: Bool {
         didSet { defaults.set(switchHUDEnabled, forKey: Self.switchHUDKey) }
-    }
-    @Published var switchNotificationsEnabled: Bool {
-        didSet {
-            defaults.set(switchNotificationsEnabled, forKey: Self.switchNotifyKey)
-            if switchNotificationsEnabled {
-                RemoteSwitchNotificationCenter.shared.requestAuthorizationIfNeeded()
-            }
-        }
     }
     @Published var switchSoundEnabled: Bool {
         didSet { defaults.set(switchSoundEnabled, forKey: Self.switchSoundKey) }
@@ -104,6 +97,7 @@ final class RemoteLANRelayManager: ObservableObject {
 
     let hotkeyMonitor = RemoteGlobalHotkeyMonitor()
     private let discovery = RemoteLANDiscoveryService()
+    private let trustStore: RemoteLANTrustStore
 
     // Coordinator callbacks
     var onReleaseLocalHoldsBeforeSwitch: (() -> Void)?
@@ -125,7 +119,6 @@ final class RemoteLANRelayManager: ObservableObject {
     var onExportLocalConfig: (() -> RemoteSyncConfigSnapshot?)?
     var onApplySyncedConfig: ((RemoteSyncConfigSnapshot, RemoteConfigSyncStrategy) -> RemoteConfigSyncResult?)?
 
-    // Optional in-memory transport hook for deterministic unit/integration testing
     var testTransportSender: ((Data) -> Void)?
     var suppressPromptWindowsForTesting = false
 
@@ -150,7 +143,6 @@ final class RemoteLANRelayManager: ObservableObject {
     private var lastAttemptedHost: String?
     private var lastAttemptedPort: UInt16?
     private var manualForcedPairing = false
-    private var lastAutoConnectAttemptByPeer: [String: Date] = [:]
 
     private var pingTask: Task<Void, Never>?
     private var pairingTimeoutTask: Task<Void, Never>?
@@ -171,7 +163,6 @@ final class RemoteLANRelayManager: ObservableObject {
     private static let autoConnectKey = "MoteFlow.lanRelay.autoConnectTrusted.v1"
     private static let dispatchModeKey = "MoteFlow.lanRelay.dispatchMode.v1"
     private static let switchHUDKey = "MoteFlow.lanRelay.switchHUD.v1"
-    private static let switchNotifyKey = "MoteFlow.lanRelay.switchNotifications.v1"
     private static let switchSoundKey = "MoteFlow.lanRelay.switchSound.v1"
     private static let hotkeyEnabledKey = "MoteFlow.lanRelay.switchHotkeyEnabled.v1"
     private static let hotkeyDataKey = "MoteFlow.lanRelay.switchHotkey.v1"
@@ -179,6 +170,11 @@ final class RemoteLANRelayManager: ObservableObject {
 
     init(defaults: UserDefaults = .standard, startImmediately: Bool = true) {
         self.defaults = defaults
+        self.trustStore = RemoteLANTrustStore(
+            defaults: defaults,
+            trustedPeersKey: Self.trustedPeersKey,
+            lastConnectedPeerKey: Self.lastConnectedPeerKey
+        )
         if let savedID = defaults.string(forKey: Self.peerIDKey), !savedID.isEmpty {
             localPeerID = savedID
         } else {
@@ -196,7 +192,6 @@ final class RemoteLANRelayManager: ObservableObject {
         allowIncomingControl = defaults.object(forKey: Self.allowIncomingKey) as? Bool ?? true
         autoConnectTrustedPeer = defaults.object(forKey: Self.autoConnectKey) as? Bool ?? true
         switchHUDEnabled = defaults.object(forKey: Self.switchHUDKey) as? Bool ?? true
-        switchNotificationsEnabled = defaults.object(forKey: Self.switchNotifyKey) as? Bool ?? true
         switchSoundEnabled = defaults.object(forKey: Self.switchSoundKey) as? Bool ?? true
         dispatchMode = RemoteRelayDispatchMode(
             rawValue: defaults.string(forKey: Self.dispatchModeKey) ?? ""
@@ -210,11 +205,7 @@ final class RemoteLANRelayManager: ObservableObject {
         }
         switchHotkeyEnabled = defaults.object(forKey: Self.hotkeyEnabledKey) as? Bool ?? true
         isServiceEnabled = defaults.object(forKey: Self.enabledKey) as? Bool ?? true
-
-        if let data = defaults.data(forKey: Self.trustedPeersKey),
-           let saved = try? JSONDecoder().decode([RemoteTrustedPeer].self, from: data) {
-            trustedPeers = saved
-        }
+        trustedPeers = trustStore.trustedPeers
 
         wireDiscoveryCallbacks()
         refreshLocalIPs()
@@ -222,9 +213,6 @@ final class RemoteLANRelayManager: ObservableObject {
             self?.toggleTarget(showHUD: true)
         }
         if startImmediately {
-            if switchNotificationsEnabled {
-                RemoteSwitchNotificationCenter.shared.requestAuthorizationIfNeeded()
-            }
             hotkeyMonitor.update(shortcut: switchShortcut, enabled: switchHotkeyEnabled)
             installWakeObserver()
             if isServiceEnabled {
@@ -237,8 +225,6 @@ final class RemoteLANRelayManager: ObservableObject {
         activeTarget == .remoteMac && isConnected && isAuthenticatedSession
     }
 
-    /// True when this Mac is acting as the remote-controlled receiver (either actively
-    /// controlled by the peer, or the peer holds the physical remote while this Mac does not).
     var isActingAsReceiverMac: Bool {
         if isControlledByPeer { return true }
         if localHasPhysicalRemote || activeTarget == .remoteMac { return false }
@@ -246,7 +232,15 @@ final class RemoteLANRelayManager: ObservableObject {
         return false
     }
 
-    /// Current mapping follow choice from the perspective of this Mac's screen.
+    var activeMappingOwnerName: String {
+        switch localMappingFollowSource {
+        case .followLocalMac:
+            return localPeerName
+        case .followRemoteMac:
+            return connectedPeerName ?? controllingPeerName ?? "另一台 Mac"
+        }
+    }
+
     var localMappingFollowSource: RemoteMappingFollowSource {
         RemoteMappingFollowSource.from(
             dispatchMode: dispatchMode,
@@ -257,10 +251,11 @@ final class RemoteLANRelayManager: ObservableObject {
     func setMappingFollowSource(_ choice: RemoteMappingFollowSource) {
         let resolved = choice.resolvedDispatchMode(localIsReceiver: isActingAsReceiverMac)
         dispatchMode = resolved
+        let peerLabel = connectedPeerName ?? controllingPeerName ?? "另一台 Mac"
         let modeDesc = choice == .followLocalMac
-            ? "跟随本机（\(localPeerName)）的遥控器配置"
-            : "跟随远程（\(connectedPeerName ?? "另一台 Mac")）的遥控器配置"
-        log("远程映射策略已切换为：\(modeDesc)")
+            ? "套用「\(localPeerName)」的遥控器方案"
+            : "套用「\(peerLabel)」的遥控器方案"
+        log("双机键位方案已切换为：\(modeDesc)")
     }
 
     func updateLocalHardwarePresence(_ hasPhysicalRemote: Bool) {
@@ -276,7 +271,7 @@ final class RemoteLANRelayManager: ObservableObject {
         )
     }
 
-    // MARK: - One-Click Configuration Sync (Merge / Overwrite)
+    // MARK: - One-Click Configuration Sync
 
     func requestPeerConfigSync(strategy: RemoteConfigSyncStrategy) {
         guard isConnected && isAuthenticatedSession else {
@@ -302,7 +297,7 @@ final class RemoteLANRelayManager: ObservableObject {
         }
     }
 
-    // MARK: - Settings & Notifications
+    // MARK: - Settings & Feedback
 
     @discardableResult
     func updateSharedPort(_ portNumber: Int) -> Bool {
@@ -331,11 +326,10 @@ final class RemoteLANRelayManager: ObservableObject {
     }
 
     func previewLocalSwitchNotification() {
-        RemoteSwitchNotificationCenter.shared.notifySwitchedToThisMac(
+        RemoteSwitchFeedback.notifySwitchedToThisMac(
             thisMacName: localPeerName,
-            detail: "通知预览 · 按当前「悬浮提示 / 系统通知 / 提示音」设置展示",
+            detail: "切换反馈预览 · 顶部灵动胶囊与轻音效（免系统通知权限）",
             hudEnabled: switchHUDEnabled,
-            systemNotificationEnabled: switchNotificationsEnabled,
             soundEnabled: switchSoundEnabled
         )
     }
@@ -344,7 +338,7 @@ final class RemoteLANRelayManager: ObservableObject {
         localIPAddresses = RemoteLANDiscoveryService.currentLANIPv4Addresses()
     }
 
-    // MARK: - Target Switching (Local Mac <-> Remote Mac)
+    // MARK: - Target Switching
 
     func toggleTarget(showHUD: Bool = true) {
         setTarget(activeTarget == .remoteMac ? .localMac : .remoteMac, showHUD: showHUD)
@@ -358,7 +352,7 @@ final class RemoteLANRelayManager: ObservableObject {
                 if let candidate = selectPreferredTrustedDiscoveredPeer(ignoreSessionPause: true) {
                     connectToDiscoveredPeer(candidate)
                     if showHUD {
-                        RemoteSwitchNotificationCenter.shared.notifyWarning(
+                        RemoteSwitchFeedback.notifyWarning(
                             title: "正在自动连接已配对的「\(candidate.name)」…",
                             detail: "连通后再次按 \(switchShortcut.display) 即可切换",
                             hudEnabled: shouldShowHUD,
@@ -366,9 +360,9 @@ final class RemoteLANRelayManager: ObservableObject {
                         )
                     }
                 } else if showHUD {
-                    RemoteSwitchNotificationCenter.shared.notifyWarning(
+                    RemoteSwitchFeedback.notifyWarning(
                         title: "尚未连接另一台 Mac · 当前仍在「\(localPeerName)」",
-                        detail: "请先在「双机互联」页面点击另一台 Mac 完成配对连接",
+                        detail: "请先在「双机协同」页面点击另一台 Mac 完成配对连接",
                         hudEnabled: shouldShowHUD,
                         soundEnabled: switchSoundEnabled
                     )
@@ -381,11 +375,10 @@ final class RemoteLANRelayManager: ObservableObject {
             sendWireMessage(.focusChanged(controllingReceiver: true, controllerName: localPeerName))
             log("切换控制目标 → 远端 Mac「\(peerTitle)」")
             if showHUD {
-                RemoteSwitchNotificationCenter.shared.notifySwitchedToOtherMac(
+                RemoteSwitchFeedback.notifySwitchedToOtherMac(
                     otherMacName: peerTitle,
                     detail: "遥控器已转发至「\(peerTitle)」· 按 \(switchShortcut.display) 切回本机",
                     hudEnabled: shouldShowHUD,
-                    systemNotificationEnabled: switchNotificationsEnabled,
                     soundEnabled: switchSoundEnabled
                 )
             }
@@ -398,18 +391,17 @@ final class RemoteLANRelayManager: ObservableObject {
             activeTarget = .localMac
             log("切换控制目标 → 本机「\(localPeerName)」")
             if showHUD {
-                RemoteSwitchNotificationCenter.shared.notifySwitchedToThisMac(
+                RemoteSwitchFeedback.notifySwitchedToThisMac(
                     thisMacName: localPeerName,
-                    detail: "遥控器现在直接控制这台 Mac（\(localPeerName)）",
+                    detail: "遥控器现在直接控制「\(localPeerName)」",
                     hudEnabled: shouldShowHUD,
-                    systemNotificationEnabled: switchNotificationsEnabled,
                     soundEnabled: switchSoundEnabled
                 )
             }
         }
     }
 
-    // MARK: - Discovery, TCP Listener & Auto-Connect (Strictly Paired Trusted Peers Only)
+    // MARK: - Discovery, TCP Listener & Auto-Connect
 
     private func installWakeObserver() {
         guard wakeObserver == nil else { return }
@@ -420,7 +412,7 @@ final class RemoteLANRelayManager: ObservableObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.isServiceEnabled else { return }
-                self.log("检测到 Mac 唤醒，正在刷新局域网并尝试自动重连已配对设备…")
+                self.log("检测到 Mac 唤醒，正在刷新局域网并自动重连已配对设备…")
                 self.refreshLocalIPs()
                 self.startNetworkServices()
             }
@@ -463,7 +455,6 @@ final class RemoteLANRelayManager: ObservableObject {
             }
         }
         autoReconnectLoopTask = Task { [weak self] in
-            // Initial grace scan for cached subnet peers if UDP broadcast is filtered
             try? await Task.sleep(for: .seconds(4))
             while !Task.isCancelled {
                 guard let self else { return }
@@ -500,8 +491,8 @@ final class RemoteLANRelayManager: ObservableObject {
     }
 
     func resumeAutoConnect() {
-        pausedAutoConnectPeerIDs.removeAll()
-        lastAutoConnectAttemptByPeer.removeAll()
+        trustStore.clearAllSessionPauses(resetAttemptTimers: true)
+        syncTrustPublishedState()
         if !autoConnectTrustedPeer {
             autoConnectTrustedPeer = true
         } else {
@@ -596,7 +587,7 @@ final class RemoteLANRelayManager: ObservableObject {
         port: UInt16,
         viaBonjour: Bool
     ) {
-        let trusted = trustedPeers.contains(where: { $0.id == id })
+        let trusted = trustStore.isTrusted(id)
         if let idx = discoveredPeers.firstIndex(where: { $0.id == id }) {
             let existing = discoveredPeers[idx]
             discoveredPeers[idx] = RemoteDiscoveredPeer(
@@ -622,24 +613,11 @@ final class RemoteLANRelayManager: ObservableObject {
         }
     }
 
-    /// Selects the highest-priority discovered peer that is ALREADY in `trustedPeers`.
-    /// Unpaired peers are strictly excluded from automatic connection.
     func selectPreferredTrustedDiscoveredPeer(ignoreSessionPause: Bool = false) -> RemoteDiscoveredPeer? {
-        let eligible = discoveredPeers.filter { peer in
-            trustedPeers.contains(where: { $0.id == peer.id }) &&
-            (ignoreSessionPause || !pausedAutoConnectPeerIDs.contains(peer.id))
-        }
-        guard !eligible.isEmpty else { return nil }
-        if let lastID = defaults.string(forKey: Self.lastConnectedPeerKey),
-           let preferred = eligible.first(where: { $0.id == lastID }) {
-            return preferred
-        }
-        // Otherwise pick the most recently paired trusted peer among discovered candidates
-        return eligible.max { lhs, rhs in
-            let lDate = trustedPeers.first(where: { $0.id == lhs.id })?.pairedAt ?? .distantPast
-            let rDate = trustedPeers.first(where: { $0.id == rhs.id })?.pairedAt ?? .distantPast
-            return lDate < rDate
-        }
+        trustStore.selectPreferredCandidate(
+            from: discoveredPeers,
+            ignoreSessionPause: ignoreSessionPause
+        )
     }
 
     private func scheduleAutoConnectCheck() {
@@ -665,33 +643,20 @@ final class RemoteLANRelayManager: ObservableObject {
         let now = Date()
 
         if let candidate = selectPreferredTrustedDiscoveredPeer() {
-            if let lastTry = lastAutoConnectAttemptByPeer[candidate.id],
-               now.timeIntervalSince(lastTry) < 5.0 {
+            guard trustStore.canAttemptAutoConnect(peerID: candidate.id, now: now, cooldownSeconds: 5.0) else {
                 return
             }
-            lastAutoConnectAttemptByPeer[candidate.id] = now
             log("检测到已配对设备「\(candidate.name)」在线，正在自动发起安全连接…")
             connectToDiscoveredPeer(candidate, isAutomatic: true)
             return
         }
 
-        // Fallback: if router filters broadcast/Bonjour, try a paired peer's last known IP
-        // on the same /24 IPv4 subnet. Handshake still strictly verifies `trustedPeers`.
-        guard allowCachedSubnetFallback, !localIPAddresses.isEmpty else { return }
-        let orderedTrusted = trustedPeers
-            .filter { !pausedAutoConnectPeerIDs.contains($0.id) }
-            .sorted { $0.pairedAt > $1.pairedAt }
-
-        for trusted in orderedTrusted {
+        guard allowCachedSubnetFallback else { return }
+        for trusted in trustStore.orderedSubnetFallbackCandidates(localIPs: localIPAddresses) {
             guard let host = trusted.lastHost,
-                  localIPAddresses.contains(where: { RemoteLANPortValidator.sameIPv4Subnet($0, host) }) else {
+                  trustStore.canAttemptAutoConnect(peerID: trusted.id, now: now, cooldownSeconds: 12.0) else {
                 continue
             }
-            if let lastTry = lastAutoConnectAttemptByPeer[trusted.id],
-               now.timeIntervalSince(lastTry) < 12.0 {
-                continue
-            }
-            lastAutoConnectAttemptByPeer[trusted.id] = now
             let port = trusted.lastPort > 0 ? trusted.lastPort : sharedPort
             guard let nwPort = NWEndpoint.Port(rawValue: port) else { continue }
             lastAttemptedHost = host
@@ -714,10 +679,10 @@ final class RemoteLANRelayManager: ObservableObject {
         isAutomatic: Bool = false
     ) {
         if isAutomatic {
-            // Hard security invariant: auto-connect NEVER runs for unpaired devices.
-            guard trustedPeers.contains(where: { $0.id == peer.id }) else { return }
+            guard trustStore.isTrusted(peer.id) else { return }
         } else {
-            pausedAutoConnectPeerIDs.remove(peer.id)
+            trustStore.unpausePeer(peer.id)
+            syncTrustPublishedState()
         }
         if !isServiceEnabled { isServiceEnabled = true }
         manualForcedPairing = isAutomatic ? false : forceRepair
@@ -751,7 +716,8 @@ final class RemoteLANRelayManager: ObservableObject {
             return false
         }
         if !isServiceEnabled { isServiceEnabled = true }
-        pausedAutoConnectPeerIDs.removeAll()
+        trustStore.clearAllSessionPauses()
+        syncTrustPublishedState()
         manualForcedPairing = forcePairing
         lastAttemptedHost = parsed.host
         lastAttemptedPort = parsed.port
@@ -764,7 +730,6 @@ final class RemoteLANRelayManager: ObservableObject {
         return true
     }
 
-    /// Deterministic in-memory peer pipe used by automated tests without opening OS sockets.
     static func connectInMemoryPairForTesting(
         client: RemoteLANRelayManager,
         server: RemoteLANRelayManager,
@@ -820,8 +785,6 @@ final class RemoteLANRelayManager: ObservableObject {
             incoming.cancel()
             return
         }
-        // Glare arbitration: if we are mid-flight opening an automatic outgoing socket
-        // to a peer whose ID is larger than ours, keep our primary outgoing attempt.
         if activeConnection != nil,
            isOutgoingInitiator,
            let targetID = pendingOutgoingPeerID,
@@ -910,7 +873,7 @@ final class RemoteLANRelayManager: ObservableObject {
         }
     }
 
-    // MARK: - Handshake, Pairing, State Sync & Config Sync State Machine
+    // MARK: - Handshake & Frame Dispatch
 
     private func handleIncomingFrame(_ message: RemoteLANWireMessage) {
         if !isAuthenticatedSession {
@@ -921,7 +884,10 @@ final class RemoteLANRelayManager: ObservableObject {
         case .ping(let sentAtMs):
             sendWireMessage(.pong(sentAtMs: sentAtMs))
         case .pong(let sentAtMs):
-            latencyMs = max(0.1, Date().timeIntervalSince1970 * 1000 - sentAtMs)
+            let measured = (max(0.1, Date().timeIntervalSince1970 * 1000 - sentAtMs) * 10).rounded() / 10
+            if latencyMs == nil || abs((latencyMs ?? 0) - measured) >= 2.0 {
+                latencyMs = measured
+            }
         case .peerStateSync(let remoteDispatchMode, let remoteHasPhysicalRemote):
             peerHasPhysicalRemote = remoteHasPhysicalRemote
             if dispatchMode != remoteDispatchMode {
@@ -955,20 +921,18 @@ final class RemoteLANRelayManager: ObservableObject {
                 onIncomingHoldEnd?(nil)
                 onIncomingVoiceEnd?()
                 if !suppressPromptWindowsForTesting {
-                    RemoteSwitchNotificationCenter.shared.notifySwitchedToOtherMac(
+                    RemoteSwitchFeedback.notifySwitchedToOtherMac(
                         otherMacName: controllerName,
                         detail: "遥控器已切回主控端「\(controllerName)」",
                         hudEnabled: switchHUDEnabled,
-                        systemNotificationEnabled: switchNotificationsEnabled,
                         soundEnabled: switchSoundEnabled
                     )
                 }
             } else if !suppressPromptWindowsForTesting {
-                RemoteSwitchNotificationCenter.shared.notifySwitchedToThisMac(
+                RemoteSwitchFeedback.notifySwitchedToThisMac(
                     thisMacName: localPeerName,
                     detail: "来自「\(controllerName)」的遥控器转发已切入这台 Mac",
                     hudEnabled: switchHUDEnabled,
-                    systemNotificationEnabled: switchNotificationsEnabled,
                     soundEnabled: switchSoundEnabled
                 )
             }
@@ -1013,7 +977,7 @@ final class RemoteLANRelayManager: ObservableObject {
             connectedPeerName = remotePeerName
 
             if !manualForcedPairing,
-               let trusted = trustedPeers.first(where: { $0.id == remotePeerID }) {
+               let trusted = trustStore.trustedPeer(id: remotePeerID) {
                 let cNonce = RemoteLANAuth.randomHex(byteCount: 16)
                 clientNonce = cNonce
                 if let hmac = RemoteLANAuth.computeHMAC(
@@ -1033,9 +997,9 @@ final class RemoteLANRelayManager: ObservableObject {
                 }
             }
 
-            // Strictly enforce: automatic reconnect NEVER triggers pairing popups for unpaired peers!
             if isAutomaticConnectionAttempt {
-                pausedAutoConnectPeerIDs.insert(remotePeerID)
+                trustStore.pauseForCurrentSession(remotePeerID)
+                syncTrustPublishedState()
                 disconnectCurrentPeer(
                     reason: "跳过自动连接：「\(remotePeerName)」尚未完成配对信任",
                     pauseSessionAutoConnect: false
@@ -1050,7 +1014,8 @@ final class RemoteLANRelayManager: ObservableObject {
                   let remoteName = connectedPeerName,
                   let sNonce = serverNonce else { return }
             if isAutomaticConnectionAttempt {
-                pausedAutoConnectPeerIDs.insert(remoteID)
+                trustStore.pauseForCurrentSession(remoteID)
+                syncTrustPublishedState()
                 disconnectCurrentPeer(
                     reason: "「\(remoteName)」已解除旧配对，请手动点击「请求配对」重新确认",
                     pauseSessionAutoConnect: false
@@ -1063,7 +1028,7 @@ final class RemoteLANRelayManager: ObservableObject {
             guard isOutgoingInitiator,
                   let cNonce = clientNonce,
                   let sNonce = serverNonce,
-                  let trusted = trustedPeers.first(where: { $0.id == remoteID }),
+                  let trusted = trustStore.trustedPeer(id: remoteID),
                   let expected = RemoteLANAuth.computeHMAC(
                     secretHex: trusted.sharedSecretHex,
                     role: "SERVER",
@@ -1090,7 +1055,7 @@ final class RemoteLANRelayManager: ObservableObject {
                 disconnectCurrentPeer(reason: "拒绝连接本机自身", pauseSessionAutoConnect: false)
                 return
             }
-            guard let trusted = trustedPeers.first(where: { $0.id == clientID }),
+            guard let trusted = trustStore.trustedPeer(id: clientID),
                   let expectedClient = RemoteLANAuth.computeHMAC(
                     secretHex: trusted.sharedSecretHex,
                     role: "CLIENT",
@@ -1289,7 +1254,8 @@ final class RemoteLANRelayManager: ObservableObject {
         manualForcedPairing = false
         isAutomaticConnectionAttempt = false
         pendingOutgoingPeerID = nil
-        pausedAutoConnectPeerIDs.remove(peerID)
+        trustStore.rememberLastConnectedPeer(peerID)
+        syncTrustPublishedState()
         isPairingInProgress = false
         outgoingPairingCode = nil
         incomingPairingRequest = nil
@@ -1297,7 +1263,6 @@ final class RemoteLANRelayManager: ObservableObject {
         isConnected = true
         connectedPeerID = peerID
         connectedPeerName = peerName
-        defaults.set(peerID, forKey: Self.lastConnectedPeerKey)
         connectionStatus = "已连接「\(peerName)」· 共享端口 \(sharedPort)"
         log("双机认证连接已建立：\(peerName)")
         refreshDiscoveredTrustFlags()
@@ -1312,12 +1277,12 @@ final class RemoteLANRelayManager: ObservableObject {
             while !Task.isCancelled {
                 guard let self, self.isConnected, self.isAuthenticatedSession else { return }
                 self.sendWireMessage(.ping(sentAtMs: Date().timeIntervalSince1970 * 1000))
-                try? await Task.sleep(for: .seconds(3))
+                try? await Task.sleep(for: .seconds(8))
             }
         }
     }
 
-    // MARK: - Trust Persistence
+    // MARK: - Trust Persistence Delegation
 
     func addTrustedPeerForTesting(_ peer: RemoteTrustedPeer) {
         rememberTrustedPeer(
@@ -1330,38 +1295,28 @@ final class RemoteLANRelayManager: ObservableObject {
     }
 
     private func rememberTrustedPeer(id: String, name: String, secretHex: String, host: String?, port: UInt16) {
-        let existingDate = trustedPeers.first(where: { $0.id == id })?.pairedAt ?? Date()
-        let peer = RemoteTrustedPeer(id: id, name: name, sharedSecretHex: secretHex, lastHost: host, lastPort: port, pairedAt: existingDate)
-        if let idx = trustedPeers.firstIndex(where: { $0.id == id }) {
-            trustedPeers[idx] = peer
-        } else {
-            trustedPeers.append(peer)
-        }
-        if let data = try? JSONEncoder().encode(trustedPeers) {
-            defaults.set(data, forKey: Self.trustedPeersKey)
-        }
+        trustStore.upsert(id: id, name: name, secretHex: secretHex, host: host, port: port)
+        syncTrustPublishedState()
         refreshDiscoveredTrustFlags()
     }
 
     func removeTrustedPeer(_ id: String) {
-        trustedPeers.removeAll { $0.id == id }
-        pausedAutoConnectPeerIDs.remove(id)
-        if defaults.string(forKey: Self.lastConnectedPeerKey) == id {
-            defaults.removeObject(forKey: Self.lastConnectedPeerKey)
-        }
-        if let data = try? JSONEncoder().encode(trustedPeers) {
-            defaults.set(data, forKey: Self.trustedPeersKey)
-        }
+        trustStore.remove(id)
+        syncTrustPublishedState()
         refreshDiscoveredTrustFlags()
         if connectedPeerID == id {
             disconnectCurrentPeer(reason: "已解除设备信任配对", pauseSessionAutoConnect: false)
         }
     }
 
+    private func syncTrustPublishedState() {
+        trustedPeers = trustStore.trustedPeers
+        pausedAutoConnectPeerIDs = trustStore.pausedAutoConnectPeerIDs
+    }
+
     private func refreshDiscoveredTrustFlags() {
         for index in discoveredPeers.indices {
-            let id = discoveredPeers[index].id
-            discoveredPeers[index].isTrusted = trustedPeers.contains(where: { $0.id == id })
+            discoveredPeers[index].isTrusted = trustStore.isTrusted(discoveredPeers[index].id)
         }
     }
 
@@ -1442,7 +1397,8 @@ final class RemoteLANRelayManager: ObservableObject {
         pauseSessionAutoConnect: Bool = true
     ) {
         if pauseSessionAutoConnect, let currentID = connectedPeerID ?? pendingOutgoingPeerID {
-            pausedAutoConnectPeerIDs.insert(currentID)
+            trustStore.pauseForCurrentSession(currentID)
+            syncTrustPublishedState()
         }
         if isConnected && isAuthenticatedSession {
             flushForwardedHoldsAndVoice()
@@ -1469,11 +1425,10 @@ final class RemoteLANRelayManager: ObservableObject {
         if activeTarget == .remoteMac {
             activeTarget = .localMac
             if !suppressPromptWindowsForTesting {
-                RemoteSwitchNotificationCenter.shared.notifySwitchedToThisMac(
+                RemoteSwitchFeedback.notifySwitchedToThisMac(
                     thisMacName: localPeerName,
                     detail: "远端连接中断（\(reason)），遥控器已自动切回本机",
                     hudEnabled: switchHUDEnabled,
-                    systemNotificationEnabled: switchNotificationsEnabled,
                     soundEnabled: switchSoundEnabled
                 )
             }
