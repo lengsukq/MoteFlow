@@ -604,4 +604,34 @@ final class RemoteMappingTests: XCTestCase {
         withMainKey.ordinaryKeyPressed()
         XCTAssertNil(withMainKey.flagsChanged(keyCode: 54))
     }
+
+    func testDoubleTapGesturePersistsConflictsAndSyncsCleanly() throws {
+        let suite = "MoteFlow.double-tap.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { XCTFail(); return }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = RemoteBindingStore(defaults: defaults)
+        XCTAssertEqual(RemoteGesture.doubleTap.title, "双击")
+        XCTAssertFalse(store.binding(for: .home).hasDoubleTapAction)
+        XCTAssertEqual(store.binding(for: .home).effectiveDoubleTapWindow, 0.28, accuracy: 0.0001)
+
+        XCTAssertTrue(store.setShortcut(shortcut, for: .home, gesture: .doubleTap))
+        store.setDoubleTapWindow(0.36, for: .home)
+        XCTAssertTrue(store.binding(for: .home).hasDoubleTapAction)
+        XCTAssertEqual(store.conflictingKey(for: shortcut, excluding: .back, gesture: .doubleTap), .home)
+        XCTAssertNil(store.conflictingKey(for: shortcut, excluding: .back, gesture: .tap))
+
+        let reloaded = RemoteBindingStore(defaults: defaults)
+        XCTAssertEqual(reloaded.action(for: .home, gesture: .doubleTap).shortcut, shortcut)
+        XCTAssertEqual(reloaded.binding(for: .home).effectiveDoubleTapWindow, 0.36, accuracy: 0.0001)
+
+        // Legacy JSON without doubleTapAction / doubleTapWindow must decode cleanly
+        let legacyJSON = Data(#"{"kind":"systemAction","systemAction":"copy"}"#.utf8)
+        let decoded = try JSONDecoder().decode(RemoteBinding.self, from: legacyJSON)
+        XCTAssertFalse(decoded.hasDoubleTapAction)
+        XCTAssertEqual(decoded.effectiveDoubleTapWindow, 0.28, accuracy: 0.0001)
+
+        reloaded.reset(.home, gesture: .doubleTap)
+        XCTAssertFalse(reloaded.binding(for: .home).hasDoubleTapAction)
+    }
 }

@@ -510,6 +510,10 @@ final class RemoteBindingStore: ObservableObject {
                        let remoteThreshold = remoteBinding.longPressThreshold {
                         current.longPressThreshold = remoteThreshold
                     }
+                    if changedKey && current.doubleTapWindow == nil,
+                       let remoteWindow = remoteBinding.doubleTapWindow {
+                        current.doubleTapWindow = remoteWindow
+                    }
                     if current.isConfigured || localMap[key] != nil {
                         localMap[key] = current
                     }
@@ -771,6 +775,13 @@ final class RemoteBindingStore: ObservableObject {
     func setLongPressThreshold(_ seconds: Double, for key: RemoteKey) {
         var binding = binding(for: key)
         binding.longPressThreshold = min(5, max(0.2, seconds))
+        bindings[key] = binding
+        save()
+    }
+
+    func setDoubleTapWindow(_ seconds: Double, for key: RemoteKey) {
+        var binding = binding(for: key)
+        binding.doubleTapWindow = min(0.60, max(0.15, seconds))
         bindings[key] = binding
         save()
     }

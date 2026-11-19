@@ -81,36 +81,134 @@ final class RemoteLANRelayTests: XCTestCase {
 
     func testRemoteMappingFollowSourceResolvesSymmetricallyAcrossHostAndReceiver() {
         // On Host Mac (localIsReceiver = false):
-        // - Follow Local Mac -> senderMapping (use Host's own mapping)
-        // - Follow Remote Mac -> receiverMapping (let Remote Mac use its own mapping)
+        // - Follow Local Mac -> senderMapping (unified Host standard across both Macs)
+        // - Follow Remote Mac -> unifiedReceiverMapping (unified Receiver standard via in-memory snapshot)
+        // - Independent -> receiverMapping (each Mac executes its own local mapping)
         XCTAssertEqual(
             RemoteMappingFollowSource.followLocalMac.resolvedDispatchMode(localIsReceiver: false),
             .senderMapping
         )
         XCTAssertEqual(
             RemoteMappingFollowSource.followRemoteMac.resolvedDispatchMode(localIsReceiver: false),
+            .unifiedReceiverMapping
+        )
+        XCTAssertEqual(
+            RemoteMappingFollowSource.independent.resolvedDispatchMode(localIsReceiver: false),
             .receiverMapping
         )
 
         // On Receiver Mac (localIsReceiver = true):
-        // - Follow Remote Mac -> senderMapping (use the remote Host Mac's mapping)
-        // - Follow Local Mac -> receiverMapping (use this Receiver Mac's own mapping)
+        // - Follow Remote Mac -> senderMapping (unified Host standard)
+        // - Follow Local Mac -> unifiedReceiverMapping (unified Receiver standard)
+        // - Independent -> receiverMapping (each Mac executes its own local mapping)
         XCTAssertEqual(
             RemoteMappingFollowSource.followRemoteMac.resolvedDispatchMode(localIsReceiver: true),
             .senderMapping
         )
         XCTAssertEqual(
             RemoteMappingFollowSource.followLocalMac.resolvedDispatchMode(localIsReceiver: true),
+            .unifiedReceiverMapping
+        )
+        XCTAssertEqual(
+            RemoteMappingFollowSource.independent.resolvedDispatchMode(localIsReceiver: true),
             .receiverMapping
         )
 
-        // Round-trip consistency
+        // Round-trip consistency across all 3 modes
         for mode in RemoteRelayDispatchMode.allCases {
             for isReceiver in [false, true] {
                 let source = RemoteMappingFollowSource.from(dispatchMode: mode, localIsReceiver: isReceiver)
                 XCTAssertEqual(source.resolvedDispatchMode(localIsReceiver: isReceiver), mode)
             }
         }
+    }
+
+    func testLiveMappingSnapshotResolutionHoldVoiceSwitchAndFraming() throws {
+        let suite = "MoteFlow.liveSnap.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            XCTFail("Cannot create isolated UserDefaults suite")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let lib = RemoteLibraryStore(storageURL: tempDir.appendingPathComponent("lib.json"))
+        let store = RemoteBindingStore(defaults: defaults)
+
+        let holdShortcut = RemoteShortcut(keyCode: 126, keyLabel: "↑", command: false, shift: false, option: false, control: false)
+        let voiceShortcut = RemoteShortcut(keyCode: 49, keyLabel: "Space", command: false, shift: false, option: true, control: false)
+        let actionID = UUID()
+        XCTAssertTrue(lib.save(RemoteLibraryAction(
+            id: actionID,
+            name: "打开终端并聚焦",
+            steps: [
+                RemoteActionStep(kind: .openApp, applicationBundleID: "com.apple.Terminal", applicationName: "Terminal"),
+                RemoteActionStep(kind: .wait, waitSeconds: 0.2)
+            ]
+        )))
+
+        store.setLongPressThreshold(0.45, for: .up)
+        _ = store.setShortcut(holdShortcut, for: .up, gesture: .longPress, replaceConflict: true)
+        store.setOutputHoldMode(.physical, for: .up, gesture: .longPress)
+        _ = store.setShortcut(voiceShortcut, for: .assistant, gesture: .longPress, replaceConflict: true)
+        store.setLibraryAction(actionID, for: .tv, gesture: .tap)
+
+        let snapshotWithoutSwitch = store.exportSyncSnapshot(peerName: "Mac mini", library: lib)
+        XCTAssertFalse(snapshotWithoutSwitch.hasSwitchMacTargetBinding(model: .googleG9N9N))
+        XCTAssertEqual(snapshotWithoutSwitch.binding(for: .up, model: .googleG9N9N).effectiveThreshold, 0.45, accuracy: 0.001)
+        XCTAssertEqual(snapshotWithoutSwitch.resolveHoldShortcut(for: .up, model: .googleG9N9N), holdShortcut)
+        XCTAssertEqual(snapshotWithoutSwitch.resolveVoiceAssistantShortcut(model: .googleG9N9N), voiceShortcut)
+
+        let tvAction = snapshotWithoutSwitch.action(for: .tv, gesture: .tap, model: .googleG9N9N)
+        XCTAssertEqual(snapshotWithoutSwitch.description(for: tvAction), "打开终端并聚焦")
+        XCTAssertEqual(snapshotWithoutSwitch.steps(for: tvAction)?.map(\.kind), [.openApp, .wait])
+
+        // Binding switchMacTarget on peer flips hasSwitchMacTargetBinding to true
+        store.setSystemAction(.switchMacTarget, for: .input, gesture: .tap)
+        let snapshotWithSwitch = store.exportSyncSnapshot(peerName: "Mac mini", library: lib)
+        XCTAssertTrue(snapshotWithSwitch.hasSwitchMacTargetBinding(model: .googleG9N9N))
+
+        // Verify liveMappingSnapshot & mappingPolicySync wire framing round-trip
+        let wireMsg = RemoteLANWireMessage.liveMappingSnapshot(snapshot: snapshotWithSwitch)
+        let policyMsg = RemoteLANWireMessage.mappingPolicySync(
+            standardPeerID: "mac-b",
+            independent: false,
+            revision: 3,
+            hasPhysicalRemote: true
+        )
+        let encoded = try RemoteLANFrameCodec.encode(wireMsg) + RemoteLANFrameCodec.encode(policyMsg)
+        var deframer = RemoteLANFrameCodec.StreamDeframer()
+        let decoded = try deframer.append(encoded)
+        XCTAssertEqual(decoded, [wireMsg, policyMsg])
+
+        // Verify deterministic connect-time arbitration (physical remote host wins; tie breaks by peerID)
+        XCTAssertTrue(RemoteMappingPolicyArbitrator.localIsAuthoritativeOnConnect(
+            localPeerID: "zzz-host",
+            remotePeerID: "aaa-receiver",
+            localHasPhysicalRemote: true,
+            remoteHasPhysicalRemote: false
+        ))
+        XCTAssertFalse(RemoteMappingPolicyArbitrator.localIsAuthoritativeOnConnect(
+            localPeerID: "aaa-receiver",
+            remotePeerID: "zzz-host",
+            localHasPhysicalRemote: false,
+            remoteHasPhysicalRemote: true
+        ))
+        XCTAssertTrue(RemoteMappingPolicyArbitrator.localIsAuthoritativeOnConnect(
+            localPeerID: "aaa",
+            remotePeerID: "bbb",
+            localHasPhysicalRemote: false,
+            remoteHasPhysicalRemote: false
+        ))
+        XCTAssertFalse(RemoteMappingPolicyArbitrator.localIsAuthoritativeOnConnect(
+            localPeerID: "bbb",
+            remotePeerID: "aaa",
+            localHasPhysicalRemote: false,
+            remoteHasPhysicalRemote: false
+        ))
     }
 
     func testOneClickConfigSyncMergeAndOverwriteWithScriptSanitization() throws {

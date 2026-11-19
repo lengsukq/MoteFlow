@@ -61,6 +61,27 @@ final class RemoteSessionCoordinator {
             }
             .store(in: &cancellables)
 
+        mappingStore.$bindings
+            .dropFirst()
+            .sink { [weak lanRelay] _ in
+                lanRelay?.scheduleLiveMappingSnapshotPush()
+            }
+            .store(in: &cancellables)
+
+        mappingStore.$activeModel
+            .dropFirst()
+            .sink { [weak lanRelay] _ in
+                lanRelay?.scheduleLiveMappingSnapshotPush()
+            }
+            .store(in: &cancellables)
+
+        actionLibrary.$actions
+            .dropFirst()
+            .sink { [weak lanRelay] _ in
+                lanRelay?.scheduleLiveMappingSnapshotPush()
+            }
+            .store(in: &cancellables)
+
         wireBluetoothAndVoiceCallbacks()
         wirePhysicalHIDCallbacks()
         wireLANRelayReceiverAndSyncCallbacks()
@@ -118,6 +139,34 @@ final class RemoteSessionCoordinator {
         return nil
     }
 
+    private func activeBorrowedSnapshot() -> RemoteSyncConfigSnapshot? {
+        lanRelay?.activeBorrowedSnapshotForLocalControl
+    }
+
+    private func isSwitchMacTargetGesture(
+        key: RemoteKey,
+        gesture: RemoteGesture,
+        model: RemoteDeviceModel,
+        store: RemoteBindingStore
+    ) -> Bool {
+        if let relay = lanRelay,
+           relay.isConnected,
+           relay.dispatchMode == .unifiedReceiverMapping,
+           let snapshot = relay.livePeerSnapshot {
+            let peerAction = snapshot.action(for: key, gesture: gesture, model: model)
+            if peerAction.kind == .systemAction && peerAction.systemAction == .switchMacTarget {
+                return true
+            }
+            if !snapshot.hasSwitchMacTargetBinding(model: model) {
+                let localAction = store.action(for: key, gesture: gesture)
+                return localAction.kind == .systemAction && localAction.systemAction == .switchMacTarget
+            }
+            return false
+        }
+        let localAction = store.action(for: key, gesture: gesture)
+        return localAction.kind == .systemAction && localAction.systemAction == .switchMacTarget
+    }
+
     private func wireBluetoothAndVoiceCallbacks() {
         guard let bluetooth, let hidCapture else { return }
 
@@ -166,8 +215,15 @@ final class RemoteSessionCoordinator {
                   let actionRunner = self.actionRunner,
                   let hidCapture = self.hidCapture else { return }
 
-            let shortcut = self.resolveVoiceAssistantShortcut(in: mappingStore, library: actionLibrary)
             let isForwarding = (self.lanRelay?.isForwardingToRemoteMac == true)
+            let borrowed = isForwarding ? nil : self.activeBorrowedSnapshot()
+            let borrowedModel = borrowed != nil ? self.verifiedActiveHardwareModel() : nil
+            let shortcut: RemoteShortcut?
+            if let borrowed, let borrowedModel {
+                shortcut = borrowed.resolveVoiceAssistantShortcut(model: borrowedModel)
+            } else {
+                shortcut = self.resolveVoiceAssistantShortcut(in: mappingStore, library: actionLibrary)
+            }
             guard self.voiceStateMachine.beginLocalOrForwardedSession(
                 forwardingToRemote: isForwarding,
                 hasVoiceShortcut: shortcut != nil,
@@ -197,7 +253,22 @@ final class RemoteSessionCoordinator {
                 case .hold:
                     actionRunner.beginVoiceShortcutHold(shortcut)
                 }
-                self.onActionFeedback?("已唤起语音热键 \(shortcut.display)", .assistant)
+                if let borrowed {
+                    self.onActionFeedback?("已唤起语音热键 \(shortcut.display)（复用「\(borrowed.sourcePeerName)」）", .assistant)
+                } else {
+                    self.onActionFeedback?("已唤起语音热键 \(shortcut.display)", .assistant)
+                }
+            } else if let borrowed, let borrowedModel {
+                let tapAction = borrowed.action(for: .assistant, gesture: .tap, model: borrowedModel)
+                guard tapAction.kind != .none else { return }
+                let inlineSteps = tapAction.kind == .libraryAction ? borrowed.steps(for: tapAction) : nil
+                actionRunner.test(
+                    action: tapAction,
+                    label: "复用「\(borrowed.sourcePeerName)」· 语音助手",
+                    library: actionLibrary,
+                    inlineSteps: inlineSteps
+                )
+                self.onActionFeedback?("已执行语音键绑定动作（复用「\(borrowed.sourcePeerName)」）", .assistant)
             } else {
                 let tapAction = mappingStore.action(for: .assistant, gesture: .tap)
                 guard tapAction.kind != .none else { return }
@@ -236,7 +307,50 @@ final class RemoteSessionCoordinator {
         guard let hidCapture else { return }
 
         hidCapture.longPressThresholdForKey = { [weak self] key in
-            self?.mappingStore?.binding(for: key).effectiveThreshold ?? 0.65
+            guard let self else { return 0.65 }
+            if let snapshot = self.activeBorrowedSnapshot(),
+               let model = self.verifiedActiveHardwareModel() {
+                return snapshot.binding(for: key, model: model).effectiveThreshold
+            }
+            return self.mappingStore?.binding(for: key).effectiveThreshold ?? 0.65
+        }
+
+        hidCapture.shouldRecognizeDoubleTap = { [weak self] key in
+            guard let self,
+                  key != .assistant,
+                  let store = self.mappingStore,
+                  let model = self.verifiedActiveHardwareModel(),
+                  model.keys.contains(key) else { return false }
+            if self.isSwitchMacTargetGesture(key: key, gesture: .doubleTap, model: model, store: store) {
+                return true
+            }
+            if let relay = self.lanRelay, relay.isForwardingToRemoteMac {
+                if relay.dispatchMode.receiverUsesOwnMapping,
+                   let peerSnapshot = relay.livePeerSnapshot {
+                    return peerSnapshot.action(for: key, gesture: .doubleTap, model: model).isEffectivelyConfigured
+                }
+                return store.action(for: key, gesture: .doubleTap).isEffectivelyConfigured
+            }
+            if let snapshot = self.activeBorrowedSnapshot() {
+                return snapshot.action(for: key, gesture: .doubleTap, model: model).isEffectivelyConfigured
+            }
+            return store.action(for: key, gesture: .doubleTap).isEffectivelyConfigured
+        }
+
+        hidCapture.doubleTapWindowForKey = { [weak self] key in
+            guard let self else { return 0.28 }
+            if let relay = self.lanRelay,
+               relay.isForwardingToRemoteMac,
+               relay.dispatchMode.receiverUsesOwnMapping,
+               let peerSnapshot = relay.livePeerSnapshot,
+               let model = self.verifiedActiveHardwareModel() {
+                return peerSnapshot.binding(for: key, model: model).effectiveDoubleTapWindow
+            }
+            if let snapshot = self.activeBorrowedSnapshot(),
+               let model = self.verifiedActiveHardwareModel() {
+                return snapshot.binding(for: key, model: model).effectiveDoubleTapWindow
+            }
+            return self.mappingStore?.binding(for: key).effectiveDoubleTapWindow ?? 0.28
         }
 
         hidCapture.shouldFollowPhysicalHold = { [weak self] key in
@@ -245,14 +359,16 @@ final class RemoteSessionCoordinator {
                   let library = self.actionLibrary,
                   let model = self.verifiedActiveHardwareModel(),
                   model.keys.contains(key) else { return false }
-            let action = store.action(for: key, gesture: .longPress)
-            if action.kind == .systemAction && action.systemAction == .switchMacTarget {
+            if self.isSwitchMacTargetGesture(key: key, gesture: .longPress, model: model, store: store) {
                 return false
             }
             if let relay = self.lanRelay,
                relay.isForwardingToRemoteMac,
-               relay.dispatchMode == .receiverMapping {
+               relay.dispatchMode.receiverUsesOwnMapping {
                 return key != .assistant
+            }
+            if let snapshot = self.activeBorrowedSnapshot() {
+                return snapshot.resolveHoldShortcut(for: key, model: model) != nil
             }
             return self.resolveHoldShortcut(for: key, in: store, library: library) != nil
         }
@@ -266,7 +382,7 @@ final class RemoteSessionCoordinator {
             }
             let localShortcut = self.resolveHoldShortcut(for: key, in: store, library: library)
             if let relay = self.lanRelay, relay.isForwardingToRemoteMac {
-                if relay.dispatchMode == .receiverMapping || localShortcut != nil {
+                if relay.dispatchMode.receiverUsesOwnMapping || localShortcut != nil {
                     let ok = relay.forwardHoldStart(key: key, senderModel: model, shortcut: localShortcut)
                     if ok {
                         self.onActionFeedback?(
@@ -277,6 +393,17 @@ final class RemoteSessionCoordinator {
                     return ok
                 }
                 return false
+            }
+            if let snapshot = self.activeBorrowedSnapshot() {
+                guard let peerShortcut = snapshot.resolveHoldShortcut(for: key, model: model) else { return false }
+                let ok = self.actionRunner?.beginMappedShortcutHold(peerShortcut, for: key) ?? false
+                if ok {
+                    self.onActionFeedback?(
+                        "按住「\(key.title)」→ \(peerShortcut.display)（复用「\(snapshot.sourcePeerName)」）",
+                        key
+                    )
+                }
+                return ok
             }
             guard let localShortcut else { return false }
             let ok = self.actionRunner?.beginMappedShortcutHold(localShortcut, for: key) ?? false
@@ -304,13 +431,13 @@ final class RemoteSessionCoordinator {
                   let model = self.verifiedActiveHardwareModel(),
                   model.keys.contains(key) else { return }
 
-            let action = store.action(for: key, gesture: gesture)
-            if action.kind == .systemAction && action.systemAction == .switchMacTarget {
+            if self.isSwitchMacTargetGesture(key: key, gesture: gesture, model: model, store: store) {
                 self.lanRelay?.toggleTarget(showHUD: true)
                 self.onActionFeedback?("已切换双机控制目标", key)
                 return
             }
 
+            let action = store.action(for: key, gesture: gesture)
             if let relay = self.lanRelay, relay.isForwardingToRemoteMac {
                 relay.forwardMappedAction(
                     key: key,
@@ -321,6 +448,24 @@ final class RemoteSessionCoordinator {
                 )
                 self.onActionFeedback?(
                     "已转发「\(key.title) · \(gesture.title)」→ \(relay.connectedPeerName ?? "远端 Mac")",
+                    key
+                )
+                return
+            }
+
+            if let snapshot = self.activeBorrowedSnapshot() {
+                let peerAction = snapshot.action(for: key, gesture: gesture, model: model)
+                guard peerAction.kind != .none else { return }
+                let summary = snapshot.description(for: peerAction)
+                let label = "复用「\(snapshot.sourcePeerName)」· \(key.title)（\(gesture.title)）"
+                if peerAction.kind == .libraryAction {
+                    guard let steps = snapshot.steps(for: peerAction), !steps.isEmpty else { return }
+                    runner.enqueueForwardedSteps(steps, label: label, library: library)
+                } else {
+                    runner.enqueueMappedAction(peerAction, label: label, library: library)
+                }
+                self.onActionFeedback?(
+                    "已触发「\(key.title) · \(gesture.title)」：\(summary)（复用「\(snapshot.sourcePeerName)」）",
                     key
                 )
                 return
@@ -390,7 +535,7 @@ final class RemoteSessionCoordinator {
                   let runner = self.actionRunner else { return }
 
             let label = "局域网远端 · \(key.title)（\(gesture.title)）"
-            if mode == .receiverMapping {
+            if mode.receiverUsesOwnMapping {
                 let localAction = store.action(for: key, gesture: gesture)
                 guard localAction.kind != .none else { return }
                 runner.enqueueMappedAction(localAction, label: label, library: library)
@@ -422,7 +567,7 @@ final class RemoteSessionCoordinator {
                   let store = self.mappingStore,
                   let library = self.actionLibrary,
                   let runner = self.actionRunner else { return }
-            if mode == .receiverMapping {
+            if mode.receiverUsesOwnMapping {
                 if let localHoldShortcut = self.resolveHoldShortcut(for: key, in: store, library: library) {
                     _ = runner.beginMappedShortcutHold(localHoldShortcut, for: key)
                 } else {
@@ -460,10 +605,10 @@ final class RemoteSessionCoordinator {
             )
             let hasVirtualMic = bluetooth.virtualMicrophone.ensureReadyForIncomingRemoteVoice()
             let localShortcut = self.resolveVoiceAssistantShortcut(in: store, library: library)
-            let targetShortcut = mode == .receiverMapping
+            let targetShortcut = mode.receiverUsesOwnMapping
                 ? (localShortcut ?? senderShortcut)
                 : (senderShortcut ?? localShortcut)
-            let trigger = mode == .receiverMapping ? monitor.doubaoShortcutTrigger : senderTrigger
+            let trigger = mode.receiverUsesOwnMapping ? monitor.doubaoShortcutTrigger : senderTrigger
 
             self.voiceStateMachine.beginIncomingRemoteSession(
                 hasVirtualMic: hasVirtualMic,

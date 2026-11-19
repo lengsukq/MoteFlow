@@ -541,10 +541,17 @@ enum RemoteBindingKind: String, Codable, CaseIterable, Identifiable {
 
 enum RemoteGesture: String, CaseIterable, Codable, Identifiable {
     case tap
+    case doubleTap
     case longPress
 
     var id: String { rawValue }
-    var title: String { self == .tap ? "单击" : "长按" }
+    var title: String {
+        switch self {
+        case .tap: "单击"
+        case .doubleTap: "双击"
+        case .longPress: "长按"
+        }
+    }
 }
 
 enum RemoteOutputHoldMode: String, Codable, CaseIterable, Identifiable {
@@ -641,6 +648,19 @@ struct RemoteAction: Codable, Equatable {
         min(10, max(0.04, outputHoldSeconds ?? 0.08))
     }
 
+    var isEffectivelyConfigured: Bool {
+        switch kind {
+        case .none:
+            false
+        case .keyboardShortcut:
+            shortcut != nil
+        case .systemAction:
+            systemAction != nil
+        case .libraryAction:
+            presetID != nil || migratedScriptPath != nil
+        }
+    }
+
     var summary: String {
         switch kind {
         case .none:
@@ -671,6 +691,9 @@ struct RemoteBinding: Codable, Equatable {
     var migratedScriptPath: String?
     var outputHoldSeconds: Double?
     var outputHoldMode: RemoteOutputHoldMode?
+    var doubleTapAction: RemoteAction?
+    /// Maximum interval (seconds) between two short presses to count as a double tap.
+    var doubleTapWindow: Double?
     var longPressAction: RemoteAction?
     /// Duration the *physical* remote key must remain depressed to count as a long press.
     var longPressThreshold: Double?
@@ -680,6 +703,7 @@ struct RemoteBinding: Codable, Equatable {
         case migratedScriptPath = "scriptPath"
         case legacyScriptID = "scriptID"
         case outputHoldSeconds, outputHoldMode
+        case doubleTapAction, doubleTapWindow
         case longPressAction, longPressThreshold
     }
 
@@ -691,6 +715,8 @@ struct RemoteBinding: Codable, Equatable {
         migratedScriptPath: String? = nil,
         outputHoldSeconds: Double? = nil,
         outputHoldMode: RemoteOutputHoldMode? = nil,
+        doubleTapAction: RemoteAction? = nil,
+        doubleTapWindow: Double? = nil,
         longPressAction: RemoteAction? = nil,
         longPressThreshold: Double? = nil
     ) {
@@ -701,6 +727,8 @@ struct RemoteBinding: Codable, Equatable {
         self.migratedScriptPath = migratedScriptPath
         self.outputHoldSeconds = outputHoldSeconds
         self.outputHoldMode = outputHoldMode
+        self.doubleTapAction = doubleTapAction
+        self.doubleTapWindow = doubleTapWindow
         self.longPressAction = longPressAction
         self.longPressThreshold = longPressThreshold
     }
@@ -734,6 +762,8 @@ struct RemoteBinding: Codable, Equatable {
         systemAction = try c.decodeIfPresent(RemoteSystemAction.self, forKey: .systemAction)
         outputHoldSeconds = try c.decodeIfPresent(Double.self, forKey: .outputHoldSeconds)
         outputHoldMode = try c.decodeIfPresent(RemoteOutputHoldMode.self, forKey: .outputHoldMode)
+        doubleTapAction = try c.decodeIfPresent(RemoteAction.self, forKey: .doubleTapAction)
+        doubleTapWindow = try c.decodeIfPresent(Double.self, forKey: .doubleTapWindow)
         longPressAction = try c.decodeIfPresent(RemoteAction.self, forKey: .longPressAction)
         longPressThreshold = try c.decodeIfPresent(Double.self, forKey: .longPressThreshold)
     }
@@ -747,6 +777,8 @@ struct RemoteBinding: Codable, Equatable {
         try c.encodeIfPresent(migratedScriptPath, forKey: .migratedScriptPath)
         try c.encodeIfPresent(outputHoldSeconds, forKey: .outputHoldSeconds)
         try c.encodeIfPresent(outputHoldMode, forKey: .outputHoldMode)
+        try c.encodeIfPresent(doubleTapAction, forKey: .doubleTapAction)
+        try c.encodeIfPresent(doubleTapWindow, forKey: .doubleTapWindow)
         try c.encodeIfPresent(longPressAction, forKey: .longPressAction)
         try c.encodeIfPresent(longPressThreshold, forKey: .longPressThreshold)
     }
@@ -755,21 +787,36 @@ struct RemoteBinding: Codable, Equatable {
         min(5, max(0.2, longPressThreshold ?? 0.65))
     }
 
+    var effectiveDoubleTapWindow: Double {
+        min(0.60, max(0.15, doubleTapWindow ?? 0.28))
+    }
+
+    var hasDoubleTapAction: Bool {
+        doubleTapAction?.isEffectivelyConfigured == true
+    }
+
     func action(for gesture: RemoteGesture) -> RemoteAction {
-        if gesture == .longPress { return longPressAction ?? RemoteAction() }
-        return RemoteAction(
-            kind: kind,
-            shortcut: shortcut,
-            systemAction: systemAction,
-            presetID: presetID,
-            migratedScriptPath: migratedScriptPath,
-            outputHoldSeconds: outputHoldSeconds,
-            outputHoldMode: outputHoldMode
-        )
+        switch gesture {
+        case .tap:
+            return RemoteAction(
+                kind: kind,
+                shortcut: shortcut,
+                systemAction: systemAction,
+                presetID: presetID,
+                migratedScriptPath: migratedScriptPath,
+                outputHoldSeconds: outputHoldSeconds,
+                outputHoldMode: outputHoldMode
+            )
+        case .doubleTap:
+            return doubleTapAction ?? RemoteAction()
+        case .longPress:
+            return longPressAction ?? RemoteAction()
+        }
     }
 
     mutating func setAction(_ action: RemoteAction, for gesture: RemoteGesture) {
-        if gesture == .tap {
+        switch gesture {
+        case .tap:
             kind = action.kind
             shortcut = action.shortcut
             systemAction = action.systemAction
@@ -777,20 +824,25 @@ struct RemoteBinding: Codable, Equatable {
             migratedScriptPath = action.migratedScriptPath
             outputHoldSeconds = action.outputHoldSeconds
             outputHoldMode = action.outputHoldMode
-        } else {
+        case .doubleTap:
+            doubleTapAction = action
+        case .longPress:
             longPressAction = action
         }
     }
 
     var isConfigured: Bool {
-        kind != .none || (longPressAction?.kind ?? .none) != .none
+        kind != .none || (doubleTapAction?.kind ?? .none) != .none || (longPressAction?.kind ?? .none) != .none
     }
 
     var summary: String {
-        let tap = action(for: .tap).summary
+        var parts: [String] = []
+        if kind != .none { parts.append(action(for: .tap).summary) }
+        let doubleTap = action(for: .doubleTap)
+        if doubleTap.kind != .none { parts.append("双击：\(doubleTap.summary)") }
         let long = action(for: .longPress)
-        if long.kind == .none { return tap }
-        return kind == .none ? "长按：\(long.summary)" : "\(tap) / 长按：\(long.summary)"
+        if long.kind != .none { parts.append("长按：\(long.summary)") }
+        return parts.isEmpty ? "未配置" : parts.joined(separator: " / ")
     }
 }
 

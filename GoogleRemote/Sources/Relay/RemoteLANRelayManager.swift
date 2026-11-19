@@ -59,6 +59,17 @@ final class RemoteLANRelayManager: ObservableObject {
         }
     }
     @Published private(set) var switchShortcut: RemoteShortcut
+    @Published var autoSwitchByAppFocus: Bool {
+        didSet {
+            defaults.set(autoSwitchByAppFocus, forKey: Self.autoSwitchByAppFocusKey)
+            manualOverrideBundleID = nil
+            if autoSwitchByAppFocus {
+                evaluateCurrentFrontmostApplication()
+            }
+        }
+    }
+    @Published private(set) var focusSwitchApps: [RemoteFocusSwitchApp]
+    @Published private(set) var lastObservedFrontmostAppName: String?
 
     @Published private(set) var activeTarget: RemoteControlTarget = .localMac
     @Published private(set) var isListening = false
@@ -82,6 +93,10 @@ final class RemoteLANRelayManager: ObservableObject {
     @Published private(set) var pausedAutoConnectPeerIDs: Set<String> = []
     @Published private(set) var isSyncingConfig = false
     @Published private(set) var lastConfigSyncMessage: String?
+    @Published private(set) var livePeerSnapshot: RemoteSyncConfigSnapshot?
+    @Published private(set) var peerSupportsUnifiedPolicy = false
+    @Published private(set) var sessionStandardPeerID: String?
+    @Published private(set) var sessionIndependent = false
     @Published private(set) var localIPAddresses: [String] = []
     @Published private(set) var logs: [String] = []
 
@@ -131,6 +146,7 @@ final class RemoteLANRelayManager: ObservableObject {
     private var isAutomaticConnectionAttempt = false
     private var pendingOutgoingPeerID: String?
     private var suppressStateEcho = false
+    private var sessionPolicyRevision: UInt64 = 0
 
     private var serverNonce: String?
     private var clientNonce: String?
@@ -147,10 +163,13 @@ final class RemoteLANRelayManager: ObservableObject {
     private var pingTask: Task<Void, Never>?
     private var pairingTimeoutTask: Task<Void, Never>?
     private var configSyncTimeoutTask: Task<Void, Never>?
+    private var liveSnapshotPushTask: Task<Void, Never>?
     private var stalePruneTask: Task<Void, Never>?
     private var autoReconnectLoopTask: Task<Void, Never>?
     private var autoConnectDebounceTask: Task<Void, Never>?
     private var wakeObserver: NSObjectProtocol?
+    private var appActivationObserver: NSObjectProtocol?
+    private var manualOverrideBundleID: String?
     private var activeForwardedHolds: Set<RemoteKey> = []
     private var activeForwardedVoice = false
 
@@ -167,6 +186,8 @@ final class RemoteLANRelayManager: ObservableObject {
     private static let hotkeyEnabledKey = "MoteFlow.lanRelay.switchHotkeyEnabled.v1"
     private static let hotkeyDataKey = "MoteFlow.lanRelay.switchHotkey.v1"
     private static let lastConnectedPeerKey = "MoteFlow.lanRelay.lastConnectedPeerID.v1"
+    private static let autoSwitchByAppFocusKey = "MoteFlow.lanRelay.autoSwitchByAppFocus.v1"
+    private static let focusSwitchAppsKey = "MoteFlow.lanRelay.focusSwitchApps.v1"
 
     init(defaults: UserDefaults = .standard, startImmediately: Bool = true) {
         self.defaults = defaults
@@ -204,6 +225,13 @@ final class RemoteLANRelayManager: ObservableObject {
             switchShortcut = RemoteGlobalHotkeyMonitor.defaultSwitchShortcut
         }
         switchHotkeyEnabled = defaults.object(forKey: Self.hotkeyEnabledKey) as? Bool ?? true
+        autoSwitchByAppFocus = defaults.object(forKey: Self.autoSwitchByAppFocusKey) as? Bool ?? false
+        if let appsData = defaults.data(forKey: Self.focusSwitchAppsKey),
+           let decodedApps = try? JSONDecoder().decode([RemoteFocusSwitchApp].self, from: appsData) {
+            focusSwitchApps = decodedApps
+        } else {
+            focusSwitchApps = [.screenSharing]
+        }
         isServiceEnabled = defaults.object(forKey: Self.enabledKey) as? Bool ?? true
         trustedPeers = trustStore.trustedPeers
 
@@ -215,6 +243,7 @@ final class RemoteLANRelayManager: ObservableObject {
         if startImmediately {
             hotkeyMonitor.update(shortcut: switchShortcut, enabled: switchHotkeyEnabled)
             installWakeObserver()
+            installAppActivationObserver()
             if isServiceEnabled {
                 startNetworkServices()
             }
@@ -232,17 +261,58 @@ final class RemoteLANRelayManager: ObservableObject {
         return false
     }
 
+    /// Whether THIS Mac is currently the active control target (host controlling itself,
+    /// or receiver currently receiving forwarded control from the peer Mac).
+    var isLocalMacActiveControlTarget: Bool {
+        if isActingAsReceiverMac && !localHasPhysicalRemote {
+            return isControlledByPeer
+        }
+        return !isForwardingToRemoteMac
+    }
+
+    /// Whether the PEER Mac is currently the active control target.
+    var isRemoteMacActiveControlTarget: Bool {
+        guard isConnected && isAuthenticatedSession else { return false }
+        if isActingAsReceiverMac && !localHasPhysicalRemote {
+            return !isControlledByPeer
+        }
+        return isForwardingToRemoteMac
+    }
+
+    var isUsingPeerMappingForSession: Bool {
+        isConnected && isAuthenticatedSession && localMappingFollowSource == .followRemoteMac
+    }
+
+    var activeBorrowedSnapshotForLocalControl: RemoteSyncConfigSnapshot? {
+        guard isConnected && isAuthenticatedSession && !isForwardingToRemoteMac,
+              localMappingFollowSource == .followRemoteMac else {
+            return nil
+        }
+        return livePeerSnapshot
+    }
+
     var activeMappingOwnerName: String {
         switch localMappingFollowSource {
         case .followLocalMac:
-            return localPeerName
+            return "本机"
         case .followRemoteMac:
-            return connectedPeerName ?? controllingPeerName ?? "另一台 Mac"
+            return "远端 Mac"
+        case .independent:
+            return "各自独立"
         }
     }
 
     var localMappingFollowSource: RemoteMappingFollowSource {
-        RemoteMappingFollowSource.from(
+        if isConnected && isAuthenticatedSession {
+            if sessionIndependent {
+                return .independent
+            }
+            if let ownerID = sessionStandardPeerID {
+                if ownerID == localPeerID { return .followLocalMac }
+                if ownerID == connectedPeerID { return .followRemoteMac }
+            }
+        }
+        return RemoteMappingFollowSource.from(
             dispatchMode: dispatchMode,
             localIsReceiver: isActingAsReceiverMac
         )
@@ -250,25 +320,110 @@ final class RemoteLANRelayManager: ObservableObject {
 
     func setMappingFollowSource(_ choice: RemoteMappingFollowSource) {
         let resolved = choice.resolvedDispatchMode(localIsReceiver: isActingAsReceiverMac)
+        if isConnected && isAuthenticatedSession {
+            sessionPolicyRevision &+= 1
+            switch choice {
+            case .followLocalMac:
+                sessionStandardPeerID = localPeerID
+                sessionIndependent = false
+            case .followRemoteMac:
+                sessionStandardPeerID = connectedPeerID
+                sessionIndependent = false
+            case .independent:
+                sessionStandardPeerID = nil
+                sessionIndependent = true
+            }
+        }
+        suppressStateEcho = true
         dispatchMode = resolved
+        suppressStateEcho = false
+        broadcastMappingPolicyAndLegacyState()
+
         let peerLabel = connectedPeerName ?? controllingPeerName ?? "另一台 Mac"
-        let modeDesc = choice == .followLocalMac
-            ? "套用「\(localPeerName)」的遥控器方案"
-            : "套用「\(peerLabel)」的遥控器方案"
+        let modeDesc: String
+        switch choice {
+        case .followLocalMac:
+            modeDesc = "统一用「\(localPeerName)」的键位方案"
+        case .followRemoteMac:
+            modeDesc = "统一用「\(peerLabel)」的键位方案（内存复用 · 不覆盖本机）"
+        case .independent:
+            modeDesc = "各自独立（控哪台用哪台自己的）"
+        }
         log("双机键位方案已切换为：\(modeDesc)")
     }
 
     func updateLocalHardwarePresence(_ hasPhysicalRemote: Bool) {
         guard localHasPhysicalRemote != hasPhysicalRemote else { return }
         localHasPhysicalRemote = hasPhysicalRemote
-        broadcastLocalPeerState()
+        reconcileDispatchModeFromSessionPolicy()
+        broadcastMappingPolicyAndLegacyState()
+    }
+
+    func pushLiveMappingSnapshotNow() {
+        liveSnapshotPushTask?.cancel()
+        liveSnapshotPushTask = nil
+        guard isConnected && isAuthenticatedSession,
+              let snapshot = onExportLocalConfig?() else { return }
+        sendWireMessage(.liveMappingSnapshot(snapshot: snapshot))
+    }
+
+    func scheduleLiveMappingSnapshotPush(debounceMs: Int = 250) {
+        guard isConnected && isAuthenticatedSession else { return }
+        liveSnapshotPushTask?.cancel()
+        liveSnapshotPushTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(debounceMs))
+            guard !Task.isCancelled, let self else { return }
+            self.pushLiveMappingSnapshotNow()
+        }
+    }
+
+    private func seedSessionPolicyFromSavedPreference(remotePeerID: String) {
+        let savedChoice = RemoteMappingFollowSource.from(
+            dispatchMode: dispatchMode,
+            localIsReceiver: isActingAsReceiverMac
+        )
+        sessionPolicyRevision = 0
+        switch savedChoice {
+        case .followLocalMac:
+            sessionStandardPeerID = localPeerID
+            sessionIndependent = false
+        case .followRemoteMac:
+            sessionStandardPeerID = remotePeerID
+            sessionIndependent = false
+        case .independent:
+            sessionStandardPeerID = nil
+            sessionIndependent = true
+        }
+    }
+
+    private func reconcileDispatchModeFromSessionPolicy() {
+        guard isConnected && isAuthenticatedSession else { return }
+        let desired = localMappingFollowSource.resolvedDispatchMode(localIsReceiver: isActingAsReceiverMac)
+        if dispatchMode != desired {
+            suppressStateEcho = true
+            dispatchMode = desired
+            suppressStateEcho = false
+        }
+    }
+
+    private func broadcastMappingPolicyAndLegacyState() {
+        guard isConnected && isAuthenticatedSession else { return }
+        sendWireMessage(
+            .mappingPolicySync(
+                standardPeerID: sessionIndependent ? nil : sessionStandardPeerID,
+                independent: sessionIndependent,
+                revision: sessionPolicyRevision,
+                hasPhysicalRemote: localHasPhysicalRemote
+            )
+        )
+        let legacyMode: RemoteRelayDispatchMode = dispatchMode == .unifiedReceiverMapping ? .receiverMapping : dispatchMode
+        sendWireMessage(
+            .peerStateSync(dispatchMode: legacyMode, hasPhysicalRemote: localHasPhysicalRemote)
+        )
     }
 
     private func broadcastLocalPeerState() {
-        guard isConnected && isAuthenticatedSession else { return }
-        sendWireMessage(
-            .peerStateSync(dispatchMode: dispatchMode, hasPhysicalRemote: localHasPhysicalRemote)
-        )
+        broadcastMappingPolicyAndLegacyState()
     }
 
     // MARK: - One-Click Configuration Sync
@@ -338,13 +493,142 @@ final class RemoteLANRelayManager: ObservableObject {
         localIPAddresses = RemoteLANDiscoveryService.currentLANIPv4Addresses()
     }
 
-    // MARK: - Target Switching
+    // MARK: - App-Focus Auto Target Switching
 
-    func toggleTarget(showHUD: Bool = true) {
-        setTarget(activeTarget == .remoteMac ? .localMac : .remoteMac, showHUD: showHUD)
+    func addFocusSwitchApp(_ app: RemoteFocusSwitchApp) {
+        let cleanID = app.bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanName = app.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanID.isEmpty, !cleanName.isEmpty else { return }
+        guard !focusSwitchApps.contains(where: { $0.bundleID.caseInsensitiveCompare(cleanID) == .orderedSame }) else {
+            return
+        }
+        focusSwitchApps.append(RemoteFocusSwitchApp(bundleID: cleanID, displayName: cleanName))
+        persistFocusSwitchApps()
+        if autoSwitchByAppFocus {
+            evaluateCurrentFrontmostApplication()
+        }
     }
 
-    func setTarget(_ target: RemoteControlTarget, showHUD: Bool = true) {
+    func removeFocusSwitchApp(bundleID: String) {
+        focusSwitchApps.removeAll { $0.bundleID.caseInsensitiveCompare(bundleID) == .orderedSame }
+        persistFocusSwitchApps()
+        if autoSwitchByAppFocus {
+            evaluateCurrentFrontmostApplication()
+        }
+    }
+
+    func toggleFocusSwitchPreset(_ preset: RemoteFocusSwitchApp) {
+        if focusSwitchApps.contains(where: { $0.bundleID.caseInsensitiveCompare(preset.bundleID) == .orderedSame }) {
+            removeFocusSwitchApp(bundleID: preset.bundleID)
+        } else {
+            addFocusSwitchApp(preset)
+        }
+    }
+
+    func isFocusSwitchAppSelected(_ bundleID: String) -> Bool {
+        focusSwitchApps.contains { $0.bundleID.caseInsensitiveCompare(bundleID) == .orderedSame }
+    }
+
+    private func persistFocusSwitchApps() {
+        if let encoded = try? JSONEncoder().encode(focusSwitchApps) {
+            defaults.set(encoded, forKey: Self.focusSwitchAppsKey)
+        }
+    }
+
+    private func installAppActivationObserver() {
+        guard appActivationObserver == nil else { return }
+        appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            let bundleID = app?.bundleIdentifier
+            let appName = app?.localizedName
+            MainActor.assumeIsolated {
+                self?.handleFrontmostApplicationChange(bundleID: bundleID, appName: appName)
+            }
+        }
+    }
+
+    func evaluateCurrentFrontmostApplication() {
+        let app = NSWorkspace.shared.frontmostApplication
+        handleFrontmostApplicationChange(bundleID: app?.bundleIdentifier, appName: app?.localizedName)
+    }
+
+    func handleFrontmostApplicationChange(bundleID: String?, appName: String?) {
+        lastObservedFrontmostAppName = appName
+        if let bundleID, let ownID = Bundle.main.bundleIdentifier,
+           bundleID.caseInsensitiveCompare(ownID) == .orderedSame {
+            return
+        }
+        if let overrideID = manualOverrideBundleID {
+            if let bundleID, overrideID.caseInsensitiveCompare(bundleID) == .orderedSame {
+                return
+            }
+            manualOverrideBundleID = nil
+        }
+        guard autoSwitchByAppFocus, isConnected, isAuthenticatedSession, !focusSwitchApps.isEmpty else {
+            return
+        }
+        let isTriggerApp = bundleID.map { id in
+            focusSwitchApps.contains { $0.bundleID.caseInsensitiveCompare(id) == .orderedSame }
+        } ?? false
+
+        if isActingAsReceiverMac && !localHasPhysicalRemote {
+            let shouldControlThisMac = !isTriggerApp
+            guard isControlledByPeer != shouldControlThisMac else { return }
+            let targetLabel = shouldControlThisMac ? localPeerName : (connectedPeerName ?? "另一台 Mac")
+            log("应用焦点切换（\(appName ?? bundleID ?? "未知应用")）→ 请求对端切换至「\(targetLabel)」")
+            sendWireMessage(
+                .requestTargetSwitch(
+                    controlRequester: shouldControlThisMac,
+                    requesterName: localPeerName,
+                    triggerAppName: appName
+                )
+            )
+            return
+        }
+
+        let desiredTarget: RemoteControlTarget = isTriggerApp ? .remoteMac : .localMac
+        guard activeTarget != desiredTarget else { return }
+        log("应用焦点切换（\(appName ?? bundleID ?? "未知应用")）→ 自动切换至「\(desiredTarget == .remoteMac ? (connectedPeerName ?? "另一台 Mac") : localPeerName)」")
+        setTarget(desiredTarget, showHUD: true, isManual: false)
+    }
+
+    // MARK: - Target Switching
+
+    /// Unified UI/hotkey entry point that works symmetrically whether the physical
+    /// remote is attached to this Mac (host) or the peer Mac (receiver).
+    func switchControlFocus(toLocalMac: Bool, showHUD: Bool = true) {
+        manualOverrideBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        if isActingAsReceiverMac && !localHasPhysicalRemote {
+            guard isConnected && isAuthenticatedSession else { return }
+            guard isControlledByPeer != toLocalMac else { return }
+            sendWireMessage(
+                .requestTargetSwitch(
+                    controlRequester: toLocalMac,
+                    requesterName: localPeerName,
+                    triggerAppName: nil
+                )
+            )
+            return
+        }
+        setTarget(toLocalMac ? .localMac : .remoteMac, showHUD: showHUD, isManual: true)
+    }
+
+    func toggleTarget(showHUD: Bool = true) {
+        if isActingAsReceiverMac && !localHasPhysicalRemote && isConnected && isAuthenticatedSession {
+            switchControlFocus(toLocalMac: !isLocalMacActiveControlTarget, showHUD: showHUD)
+            return
+        }
+        setTarget(activeTarget == .remoteMac ? .localMac : .remoteMac, showHUD: showHUD, isManual: true)
+    }
+
+    func setTarget(_ target: RemoteControlTarget, showHUD: Bool = true, isManual: Bool = true) {
+        if isManual {
+            manualOverrideBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        }
         let shouldShowHUD = showHUD && switchHUDEnabled
         if target == .remoteMac {
             guard isConnected && isAuthenticatedSession else {
@@ -890,12 +1174,46 @@ final class RemoteLANRelayManager: ObservableObject {
             }
         case .peerStateSync(let remoteDispatchMode, let remoteHasPhysicalRemote):
             peerHasPhysicalRemote = remoteHasPhysicalRemote
-            if dispatchMode != remoteDispatchMode {
+            if peerSupportsUnifiedPolicy {
+                reconcileDispatchModeFromSessionPolicy()
+            } else if dispatchMode != remoteDispatchMode {
                 suppressStateEcho = true
                 dispatchMode = remoteDispatchMode
                 suppressStateEcho = false
                 log("已同步对端远程映射模式：\(remoteDispatchMode.title)")
             }
+        case .mappingPolicySync(let standardPeerID, let independent, let revision, let remoteHasPhysicalRemote):
+            peerSupportsUnifiedPolicy = true
+            let wasReceiver = isActingAsReceiverMac
+            peerHasPhysicalRemote = remoteHasPhysicalRemote
+            let remoteID = connectedPeerID ?? ""
+            let shouldAdopt: Bool
+            if revision > sessionPolicyRevision {
+                shouldAdopt = true
+            } else if revision == sessionPolicyRevision {
+                shouldAdopt = !RemoteMappingPolicyArbitrator.localIsAuthoritativeOnConnect(
+                    localPeerID: localPeerID,
+                    remotePeerID: remoteID,
+                    localHasPhysicalRemote: localHasPhysicalRemote,
+                    remoteHasPhysicalRemote: remoteHasPhysicalRemote
+                )
+            } else {
+                shouldAdopt = false
+            }
+            if shouldAdopt {
+                sessionPolicyRevision = revision
+                sessionIndependent = independent
+                sessionStandardPeerID = independent ? nil : standardPeerID
+                reconcileDispatchModeFromSessionPolicy()
+                log("双机键位标准已同步：\(activeMappingOwnerName)")
+            } else {
+                reconcileDispatchModeFromSessionPolicy()
+            }
+            if !wasReceiver && isActingAsReceiverMac && autoSwitchByAppFocus && testTransportSender == nil {
+                evaluateCurrentFrontmostApplication()
+            }
+        case .liveMappingSnapshot(let snapshot):
+            livePeerSnapshot = snapshot.sanitized()
         case .requestConfigSnapshot(let requestID):
             guard let snapshot = onExportLocalConfig?() else { return }
             sendWireMessage(.configSnapshotResponse(requestID: requestID, snapshot: snapshot))
@@ -914,6 +1232,12 @@ final class RemoteLANRelayManager: ObservableObject {
             } else {
                 lastConfigSyncMessage = "已完成来自「\(snapshot.sourcePeerName)」的配置同步。"
             }
+        case .requestTargetSwitch(let controlRequester, let requesterName, let triggerAppName):
+            let desiredTarget: RemoteControlTarget = controlRequester ? .remoteMac : .localMac
+            guard activeTarget != desiredTarget else { return }
+            let appDesc = triggerAppName.map { "（\($0)）" } ?? ""
+            log("收到「\(requesterName)」应用焦点请求\(appDesc) → 切换至「\(desiredTarget == .remoteMac ? requesterName : localPeerName)」")
+            setTarget(desiredTarget, showHUD: true, isManual: false)
         case .focusChanged(let controllingReceiver, let controllerName):
             isControlledByPeer = controllingReceiver
             controllingPeerName = controllingReceiver ? controllerName : nil
@@ -1264,10 +1588,16 @@ final class RemoteLANRelayManager: ObservableObject {
         connectedPeerID = peerID
         connectedPeerName = peerName
         connectionStatus = "已连接「\(peerName)」· 共享端口 \(sharedPort)"
+        peerSupportsUnifiedPolicy = false
+        seedSessionPolicyFromSavedPreference(remotePeerID: peerID)
         log("双机认证连接已建立：\(peerName)")
         refreshDiscoveredTrustFlags()
-        broadcastLocalPeerState()
+        broadcastMappingPolicyAndLegacyState()
+        pushLiveMappingSnapshotNow()
         startPingLoop()
+        if autoSwitchByAppFocus && testTransportSender == nil {
+            evaluateCurrentFrontmostApplication()
+        }
     }
 
     private func startPingLoop() {
@@ -1334,11 +1664,12 @@ final class RemoteLANRelayManager: ObservableObject {
         let safeSteps = action.kind == .libraryAction
             ? RemoteLANForwardedStep.sanitizedSteps(from: library.steps(for: action))
             : nil
+        let wireMode: RemoteRelayDispatchMode = dispatchMode.receiverUsesOwnMapping ? .receiverMapping : .senderMapping
         sendWireMessage(
             .forwardedAction(
                 key: key,
                 gesture: gesture,
-                mode: dispatchMode,
+                mode: wireMode,
                 senderModel: senderModel,
                 shortcut: action.shortcut,
                 holdSeconds: action.effectiveHoldSeconds,
@@ -1353,7 +1684,8 @@ final class RemoteLANRelayManager: ObservableObject {
         guard isForwardingToRemoteMac else { return false }
         activeForwardedHolds.insert(key)
         forwardedCount += 1
-        sendWireMessage(.holdStart(key: key, mode: dispatchMode, senderModel: senderModel, shortcut: shortcut))
+        let wireMode: RemoteRelayDispatchMode = dispatchMode.receiverUsesOwnMapping ? .receiverMapping : .senderMapping
+        sendWireMessage(.holdStart(key: key, mode: wireMode, senderModel: senderModel, shortcut: shortcut))
         return true
     }
 
@@ -1366,7 +1698,8 @@ final class RemoteLANRelayManager: ObservableObject {
         guard isForwardingToRemoteMac, !activeForwardedVoice else { return }
         activeForwardedVoice = true
         forwardedCount += 1
-        sendWireMessage(.voiceStart(sampleRate: sampleRate, mode: dispatchMode, shortcut: shortcut, trigger: trigger))
+        let wireMode: RemoteRelayDispatchMode = dispatchMode.receiverUsesOwnMapping ? .receiverMapping : .senderMapping
+        sendWireMessage(.voiceStart(sampleRate: sampleRate, mode: wireMode, shortcut: shortcut, trigger: trigger))
     }
 
     func forwardVoicePCM(samples: [Int16], sampleRate: Int) {
@@ -1416,6 +1749,13 @@ final class RemoteLANRelayManager: ObservableObject {
         pairingTimeoutTask = nil
         configSyncTimeoutTask?.cancel()
         configSyncTimeoutTask = nil
+        liveSnapshotPushTask?.cancel()
+        liveSnapshotPushTask = nil
+        livePeerSnapshot = nil
+        peerSupportsUnifiedPolicy = false
+        sessionStandardPeerID = nil
+        sessionIndependent = false
+        sessionPolicyRevision = 0
         pingTask?.cancel()
         pingTask = nil
         if isControlledByPeer {

@@ -30,34 +30,68 @@ enum RemoteControlTarget: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-/// Determines whether forwarded remote events use the sender (physical remote host)
-/// Mac's configured actions or let the receiving (controlled) Mac resolve its own
-/// local button mappings.
+/// An application whose foreground activation automatically switches remote
+/// control focus to the peer Mac (and back to this Mac when leaving).
+struct RemoteFocusSwitchApp: Codable, Identifiable, Equatable, Hashable {
+    var bundleID: String
+    var displayName: String
+
+    var id: String { bundleID }
+
+    static let screenSharing = RemoteFocusSwitchApp(
+        bundleID: "com.apple.ScreenSharing",
+        displayName: "屏幕共享"
+    )
+
+    static let recommendedPresets: [RemoteFocusSwitchApp] = [
+        .screenSharing,
+        RemoteFocusSwitchApp(bundleID: "com.carriez.flutter_hbb", displayName: "RustDesk"),
+        RemoteFocusSwitchApp(bundleID: "tv.parsec.www", displayName: "Parsec"),
+        RemoteFocusSwitchApp(bundleID: "com.moonlight-stream.Moonlight", displayName: "Moonlight"),
+        RemoteFocusSwitchApp(bundleID: "com.p5sys.jump.mac.viewer", displayName: "Jump Desktop"),
+        RemoteFocusSwitchApp(bundleID: "com.teamviewer.TeamViewer", displayName: "TeamViewer")
+    ]
+}
+
+/// Determines which Mac's button mapping acts as the active standard during a
+/// connected Dual-Mac session (without overwriting either Mac's local config).
 enum RemoteRelayDispatchMode: String, Codable, CaseIterable, Identifiable {
+    /// Both Macs follow the host Mac (holding the physical remote) across all screens.
     case senderMapping
+    /// Both Macs follow the peer/receiver Mac via an ephemeral in-memory snapshot (zero overwrite).
+    case unifiedReceiverMapping
+    /// Each Mac executes its own local mapping when controlled.
     case receiverMapping
 
     var id: String { rawValue }
 
+    /// Whether the receiving Mac should resolve forwarded keys using its own local store.
+    var receiverUsesOwnMapping: Bool {
+        self == .receiverMapping || self == .unifiedReceiverMapping
+    }
+
     var title: String {
         switch self {
-        case .senderMapping: "同步主控端配置（免二次设置）"
-        case .receiverMapping: "使用受控端独立映射"
+        case .senderMapping: "统一用主控端方案（双机一致）"
+        case .unifiedReceiverMapping: "统一用受控端方案（双机一致 · 内存复用）"
+        case .receiverMapping: "各自独立（控哪台用哪台自己的）"
         }
     }
 
     var detail: String {
         switch self {
-        case .senderMapping: "直接按连接着实体遥控器的那台 Mac 设好的快捷键、系统动作、长按和语音执行。"
-        case .receiverMapping: "只转发遥控器按键与长按信号，由被控制的那台 Mac 按它自己保存的按键映射执行。"
+        case .senderMapping: "联机期间控两台 Mac 都按主控端配置执行，不改动受控端本地设置。"
+        case .unifiedReceiverMapping: "联机期间控两台 Mac 都按受控端配置执行（主控端仅在内存临时复用，断开即恢复）。"
+        case .receiverMapping: "只转发遥控器按键与长按信号，控哪台 Mac 就用哪台自己保存的按键映射。"
         }
     }
 }
 
-/// User-facing choice on whichever Mac screen the user is currently operating.
+/// User-facing 3-way choice on whichever Mac screen the user is currently operating.
 enum RemoteMappingFollowSource: String, Codable, CaseIterable, Identifiable {
-    case followRemoteMac
     case followLocalMac
+    case followRemoteMac
+    case independent
 
     var id: String { rawValue }
 
@@ -66,21 +100,41 @@ enum RemoteMappingFollowSource: String, Codable, CaseIterable, Identifiable {
         case (.followLocalMac, false):
             return .senderMapping
         case (.followRemoteMac, false):
-            return .receiverMapping
+            return .unifiedReceiverMapping
         case (.followRemoteMac, true):
             return .senderMapping
         case (.followLocalMac, true):
+            return .unifiedReceiverMapping
+        case (.independent, _):
             return .receiverMapping
         }
     }
 
     static func from(dispatchMode: RemoteRelayDispatchMode, localIsReceiver: Bool) -> RemoteMappingFollowSource {
         switch (dispatchMode, localIsReceiver) {
-        case (.senderMapping, false), (.receiverMapping, true):
+        case (.senderMapping, false), (.unifiedReceiverMapping, true):
             return .followLocalMac
-        case (.receiverMapping, false), (.senderMapping, true):
+        case (.unifiedReceiverMapping, false), (.senderMapping, true):
             return .followRemoteMac
+        case (.receiverMapping, _):
+            return .independent
         }
+    }
+}
+
+/// Deterministic arbitration when two Macs connect with differing saved mapping
+/// rules so both sides converge to the exact same rule without swapping.
+enum RemoteMappingPolicyArbitrator {
+    static func localIsAuthoritativeOnConnect(
+        localPeerID: String,
+        remotePeerID: String,
+        localHasPhysicalRemote: Bool,
+        remoteHasPhysicalRemote: Bool
+    ) -> Bool {
+        if localHasPhysicalRemote != remoteHasPhysicalRemote {
+            return localHasPhysicalRemote
+        }
+        return localPeerID < remotePeerID
     }
 }
 
@@ -129,6 +183,85 @@ struct RemoteSyncConfigSnapshot: Codable, Equatable {
     var totalConfiguredKeyCount: Int {
         modelBindings.values.reduce(0) { partial, dict in
             partial + dict.values.filter(\.isConfigured).count
+        }
+    }
+
+    func binding(for key: RemoteKey, model: RemoteDeviceModel) -> RemoteBinding {
+        modelBindings[model.id]?[key] ?? RemoteBinding()
+    }
+
+    func action(for key: RemoteKey, gesture: RemoteGesture, model: RemoteDeviceModel) -> RemoteAction {
+        binding(for: key, model: model).action(for: gesture)
+    }
+
+    func steps(for remoteAction: RemoteAction) -> [RemoteActionStep]? {
+        switch remoteAction.kind {
+        case .none, .systemAction:
+            return nil
+        case .libraryAction:
+            guard let id = remoteAction.presetID,
+                  let item = libraryActions.first(where: { $0.id == id }) else {
+                return nil
+            }
+            let safeSteps = item.steps.filter { $0.kind != .script }
+            return safeSteps.isEmpty ? nil : safeSteps
+        case .keyboardShortcut:
+            guard let shortcut = remoteAction.shortcut else { return nil }
+            return [RemoteActionStep(
+                kind: .keyboard,
+                shortcut: shortcut,
+                holdSeconds: remoteAction.effectiveHoldSeconds
+            )]
+        }
+    }
+
+    func description(for action: RemoteAction) -> String {
+        if action.kind == .libraryAction {
+            if let id = action.presetID,
+               let item = libraryActions.first(where: { $0.id == id }) {
+                return item.name
+            }
+            return "对端动作（未同步）"
+        }
+        return action.summary
+    }
+
+    func resolveHoldShortcut(for key: RemoteKey, model: RemoteDeviceModel) -> RemoteShortcut? {
+        let act = action(for: key, gesture: .longPress, model: model)
+        guard act.effectiveHoldMode == .physical else { return nil }
+        if act.kind == .keyboardShortcut {
+            return act.shortcut
+        }
+        if act.kind == .libraryAction,
+           let resolved = steps(for: act),
+           resolved.count == 1,
+           resolved[0].kind == .keyboard {
+            return resolved[0].shortcut
+        }
+        return nil
+    }
+
+    func resolveVoiceAssistantShortcut(model: RemoteDeviceModel) -> RemoteShortcut? {
+        for gesture in [RemoteGesture.longPress, .tap] {
+            let act = action(for: .assistant, gesture: gesture, model: model)
+            if let resolved = steps(for: act),
+               resolved.count == 1,
+               let first = resolved.first,
+               first.kind == .keyboard,
+               let shortcut = first.shortcut {
+                return shortcut
+            }
+        }
+        return nil
+    }
+
+    func hasSwitchMacTargetBinding(model: RemoteDeviceModel) -> Bool {
+        guard let map = modelBindings[model.id] else { return false }
+        return map.values.contains { binding in
+            RemoteGesture.allCases.contains { gesture in
+                let act = binding.action(for: gesture)
+                return act.kind == .systemAction && act.systemAction == .switchMacTarget
+            }
         }
     }
 
@@ -589,7 +722,15 @@ enum RemoteLANWireMessage: Codable, Equatable {
     case ping(sentAtMs: Double)
     case pong(sentAtMs: Double)
     case focusChanged(controllingReceiver: Bool, controllerName: String)
+    case requestTargetSwitch(controlRequester: Bool, requesterName: String, triggerAppName: String?)
     case peerStateSync(dispatchMode: RemoteRelayDispatchMode, hasPhysicalRemote: Bool)
+    case mappingPolicySync(
+        standardPeerID: String?,
+        independent: Bool,
+        revision: UInt64,
+        hasPhysicalRemote: Bool
+    )
+    case liveMappingSnapshot(snapshot: RemoteSyncConfigSnapshot)
     case requestConfigSnapshot(requestID: UUID)
     case configSnapshotResponse(requestID: UUID, snapshot: RemoteSyncConfigSnapshot)
     case forwardedAction(
