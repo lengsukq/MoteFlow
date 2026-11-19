@@ -63,6 +63,11 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
     @Published private(set) var status = "等待检查虚拟音频设备"
     @Published private(set) var forwardedFrames = 0
 
+    /// True when routing to MoteFlow's input-only `MoteFlowMic.driver` (zero AudioQueue output -> zero Screen Sharing echo).
+    var isUsingDirectPushMic: Bool {
+        MoteFlowMicDriverManager.isDirectPushDevice(selectedUID)
+    }
+
     private static let uidKey = "GoogleRemote.virtualMicOutputUID.v1"
     private static let enabledKey = "GoogleRemote.virtualMicEnabled.v1"
     private static let switchInputKey = "GoogleRemote.virtualMicAutoInput.v1"
@@ -74,6 +79,7 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
 
     private let echoSuppressor = SpeakerEchoSuppressor()
     private var queue: AudioQueueRef?
+    private var directPushDeviceID: AudioDeviceID?
     private var drainDisposeTask: Task<Void, Never>?
     private var queuedFrames = 0
     private var started = false
@@ -101,7 +107,9 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
         }
         guard !devices.isEmpty else { return false }
         if selectedUID.isEmpty || !devices.contains(where: { $0.id == selectedUID }) {
-            if let preferred = devices.first(where: { $0.name.localizedCaseInsensitiveContains("BlackHole 2ch") }) ?? devices.first {
+            if let preferred = devices.first(where: { MoteFlowMicDriverManager.isDirectPushDevice($0.id) })
+                ?? devices.first(where: { $0.name.localizedCaseInsensitiveContains("BlackHole 2ch") })
+                ?? devices.first {
                 selectedUID = preferred.id
             }
         }
@@ -133,6 +141,9 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
     // MARK: - Anti-Echo Speaker Suppression Delegation
 
     func engageSpeakerEchoSuppression() {
+        // Input-only MoteFlowMic.driver produces zero audio output streams,
+        // so speakers never need to be muted during speech.
+        guard !isUsingDirectPushMic else { return }
         echoSuppressor.engage(
             enabled: suppressSpeakerEchoDuringVoice,
             defaultOutputID: CoreAudioDeviceQuery.defaultOutputID(),
@@ -300,16 +311,25 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
                 return nil
             }
             let lower = name.lowercased()
-            guard lower.contains("blackhole") || lower.contains("loopback") ||
+            guard MoteFlowMicDriverManager.isDirectPushDevice(uid) ||
+                  lower.contains("moteflow mic") ||
+                  lower.contains("blackhole") || lower.contains("loopback") ||
                   lower.contains("virtual microphone") else { return nil }
             return RemoteVirtualAudioDevice(id: uid, name: name)
+        }.sorted { lhs, rhs in
+            let lhsDirect = MoteFlowMicDriverManager.isDirectPushDevice(lhs.id)
+            let rhsDirect = MoteFlowMicDriverManager.isDirectPushDevice(rhs.id)
+            if lhsDirect != rhsDirect { return lhsDirect }
+            return lhs.name < rhs.name
         }
         physicalInputs = ids.compactMap { id -> RemoteVirtualAudioDevice? in
             guard let name = CoreAudioDeviceQuery.deviceString(id, selector: kAudioObjectPropertyName),
                   let uid = CoreAudioDeviceQuery.deviceString(id, selector: kAudioDevicePropertyDeviceUID),
                   CoreAudioDeviceQuery.inputSupportsCapture(id) else { return nil }
             let lowered = name.lowercased()
-            guard !lowered.contains("blackhole"), !lowered.contains("loopback"),
+            guard !MoteFlowMicDriverManager.isDirectPushDevice(uid),
+                  !lowered.contains("moteflow mic"),
+                  !lowered.contains("blackhole"), !lowered.contains("loopback"),
                   !lowered.contains("virtual microphone") else { return nil }
             return RemoteVirtualAudioDevice(id: uid, name: name)
         }
@@ -318,12 +338,14 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
                   let uid = CoreAudioDeviceQuery.deviceString(id, selector: kAudioDevicePropertyDeviceUID),
                   CoreAudioDeviceQuery.outputSupportsPlayback(id) else { return nil }
             let lowered = name.lowercased()
-            guard !lowered.contains("blackhole"), !lowered.contains("loopback"),
+            guard !MoteFlowMicDriverManager.isDirectPushDevice(uid),
+                  !lowered.contains("moteflow mic"),
+                  !lowered.contains("blackhole"), !lowered.contains("loopback"),
                   !lowered.contains("virtual microphone") else { return nil }
             return RemoteVirtualAudioDevice(id: uid, name: name)
         }
-        if selectedUID.isEmpty, devices.count == 1, let first = devices.first {
-            selectedUID = first.id
+        if selectedUID.isEmpty, let preferred = devices.first(where: { MoteFlowMicDriverManager.isDirectPushDevice($0.id) }) ?? devices.first {
+            selectedUID = preferred.id
         }
         refreshInputState()
         if devices.isEmpty {
@@ -338,7 +360,7 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
         }
     }
 
-    // MARK: - AudioQueue Streaming
+    // MARK: - Direct-Push (MoteFlowMic.driver) & AudioQueue (BlackHole Fallback) Streaming
 
     func beginSession(sourceRate: Int) {
         drainDisposeTask?.cancel()
@@ -354,6 +376,28 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
             return
         }
         self.sourceRate = sourceRate
+
+        if MoteFlowMicDriverManager.isDirectPushDevice(selected.id) {
+            guard let deviceID = CoreAudioDeviceQuery.idForUID(selected.id) else {
+                status = "未找到已加载的 MoteFlow Mic 设备，请刷新或重新安装驱动。"
+                return
+            }
+            let resetStatus = MoteFlowMicDriverManager.resetBuffer(deviceID: deviceID)
+            guard resetStatus == noErr else {
+                status = "无法连接 MoteFlow Mic 驱动通道（CoreAudio \(resetStatus)）。"
+                return
+            }
+            directPushDeviceID = deviceID
+            queuedFrames = 0
+            forwardedFrames = 0
+            started = true
+            outputStarted = true
+            lastSessionOutputStarted = true
+            isRouting = true
+            status = "正在零回声直推语音到「\(selected.name)」（纯输入无输出流）"
+            return
+        }
+
         var format = AudioStreamBasicDescription(
             mSampleRate: Double(Self.outputRate),
             mFormatID: kAudioFormatLinearPCM,
@@ -403,6 +447,28 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
 
     func write(samples: [Int16], sampleRate: Int) {
         guard isEnabled, !samples.isEmpty else { return }
+        if isUsingDirectPushMic {
+            if !isRouting || directPushDeviceID == nil || sourceRate != sampleRate {
+                beginSession(sourceRate: sampleRate)
+            }
+            guard isRouting, let deviceID = directPushDeviceID else { return }
+            let stereo = ATVVVirtualMicPCM.stereo48k(samples: samples, sourceRate: sampleRate)
+            let pushStatus = MoteFlowMicDriverManager.pushStereo48kPCM(deviceID: deviceID, samples: stereo)
+            guard pushStatus == noErr else {
+                status = "直推 PCM 到 MoteFlow Mic 失败：\(pushStatus)"
+                endSession()
+                return
+            }
+            let frames = stereo.count / 2
+            queuedFrames += frames
+            forwardedFrames += frames
+            if Date().timeIntervalSince(lastStatusUpdate) >= 1 {
+                lastStatusUpdate = Date()
+                status = "已向 MoteFlow Mic 零回声直推 \(forwardedFrames / 48_000) 秒 PCM"
+            }
+            return
+        }
+
         if !isRouting || queue == nil || sourceRate != sampleRate {
             beginSession(sourceRate: sampleRate)
         }
@@ -450,6 +516,23 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
     }
 
     func endSessionGracefully() {
+        if let deviceID = directPushDeviceID {
+            directPushDeviceID = nil
+            queuedFrames = 0
+            started = false
+            outputStarted = false
+            isRouting = false
+            status = "语音会话收尾中，正在等待应用读取末尾缓冲…"
+            drainDisposeTask?.cancel()
+            drainDisposeTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(160))
+                _ = MoteFlowMicDriverManager.resetBuffer(deviceID: deviceID)
+                if self?.isRouting == false {
+                    self?.status = "语音会话已结束，MoteFlow Mic 直推已停止。"
+                }
+            }
+            return
+        }
         guard let activeQueue = queue else {
             endSession()
             return
@@ -476,6 +559,10 @@ final class RemoteVirtualMicrophoneRouter: ObservableObject {
     }
 
     func endSession() {
+        if let deviceID = directPushDeviceID {
+            _ = MoteFlowMicDriverManager.resetBuffer(deviceID: deviceID)
+            directPushDeviceID = nil
+        }
         if let queue {
             _ = AudioQueueStop(queue, true)
             _ = AudioQueueDispose(queue, true)

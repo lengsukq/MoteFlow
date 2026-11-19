@@ -28,6 +28,44 @@ has_xcodebuild() {
   xcodebuild -version >/dev/null 2>&1
 }
 
+resolve_sign_identity() {
+  if [[ -n "${MOTEFLOW_SIGN_ID:-}" ]]; then
+    echo "$MOTEFLOW_SIGN_ID"
+    return
+  fi
+  if [[ -n "$TEAM" ]]; then
+    while IFS= read -r line; do
+      local name ou
+      name="$(echo "$line" | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p')"
+      [[ -z "$name" ]] && continue
+      ou="$(security find-certificate -c "${name#Apple Development: }" -p 2>/dev/null | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*OU=\([^,/]*\).*/\1/p' || true)"
+      if [[ "$ou" == "$TEAM" ]]; then
+        echo "$name"
+        return
+      fi
+    done < <(security find-identity -v -p codesigning 2>/dev/null || true)
+  fi
+  security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' | head -n 1 || true
+}
+
+bundle_and_sign_driver() {
+  local sign_id="$1"
+  MOTEFLOW_SIGN_ID="$sign_id" bash "$ROOT/Drivers/MoteFlowMic/build_driver.sh" "$BUILD_DIR/driver-stage"
+  rm -rf "$STAGED/Contents/Resources/MoteFlowMic.driver"
+  ditto "$BUILD_DIR/driver-stage/MoteFlowMic.driver" "$STAGED/Contents/Resources/MoteFlowMic.driver"
+  if [[ -n "$sign_id" ]]; then
+    echo "Signing with identity: $sign_id"
+    codesign --force --deep --options runtime \
+      --entitlements GoogleRemote/GoogleRemote.entitlements \
+      --sign "$sign_id" "$STAGED"
+  else
+    echo "No Apple Development certificate found in accessible keychain; applying local ad-hoc signature so app can run."
+    codesign --force --deep \
+      --entitlements GoogleRemote/GoogleRemote.entitlements \
+      --sign - "$STAGED"
+  fi
+}
+
 build_with_command_line_tools() {
   echo "Xcode.app not active; building Release MoteFlow.app via Swift Command Line Tools..."
   rm -rf "$STAGED"
@@ -87,6 +125,18 @@ PY
      "$STAGED/Contents/Resources/MoteFlowStatusIcon@2x.png"
   cp "GoogleRemote/Assets.xcassets/MoteFlowStatusIcon.imageset/mote-flow-status-3x.png" \
      "$STAGED/Contents/Resources/MoteFlowStatusIcon@3x.png"
+  cp "GoogleRemote/Assets.xcassets/MoteFlowStatusIconRemote.imageset/mote-flow-status-remote-1x.png" \
+     "$STAGED/Contents/Resources/MoteFlowStatusIconRemote.png"
+  cp "GoogleRemote/Assets.xcassets/MoteFlowStatusIconRemote.imageset/mote-flow-status-remote-2x.png" \
+     "$STAGED/Contents/Resources/MoteFlowStatusIconRemote@2x.png"
+  cp "GoogleRemote/Assets.xcassets/MoteFlowStatusIconRemote.imageset/mote-flow-status-remote-3x.png" \
+     "$STAGED/Contents/Resources/MoteFlowStatusIconRemote@3x.png"
+  cp "GoogleRemote/Assets.xcassets/MoteFlowStatusIconControlled.imageset/mote-flow-status-controlled-1x.png" \
+     "$STAGED/Contents/Resources/MoteFlowStatusIconControlled.png"
+  cp "GoogleRemote/Assets.xcassets/MoteFlowStatusIconControlled.imageset/mote-flow-status-controlled-2x.png" \
+     "$STAGED/Contents/Resources/MoteFlowStatusIconControlled@2x.png"
+  cp "GoogleRemote/Assets.xcassets/MoteFlowStatusIconControlled.imageset/mote-flow-status-controlled-3x.png" \
+     "$STAGED/Contents/Resources/MoteFlowStatusIconControlled@3x.png"
 
   printf 'APPL????' > "$STAGED/Contents/PkgInfo"
 
@@ -138,24 +188,10 @@ PY
 PLIST
   plutil -lint "$STAGED/Contents/Info.plist" >/dev/null
 
-  local sign_id=""
-  sign_id="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' | head -n 1)"
-  if [[ -n "$sign_id" ]]; then
-    echo "Signing with identity: $sign_id"
-    codesign --force --deep --options runtime \
-      --entitlements GoogleRemote/GoogleRemote.entitlements \
-      --sign "$sign_id" "$STAGED"
-  elif [[ "$ALLOW_ADHOC" == "1" ]]; then
-    echo "No Apple Development identity accessible in current keychain; applying ad-hoc signature..."
-    codesign --force --deep \
-      --entitlements GoogleRemote/GoogleRemote.entitlements \
-      --sign - "$STAGED"
-  else
-    echo "No Apple Development certificate found in accessible keychain; applying local ad-hoc signature so app can run."
-    codesign --force --deep \
-      --entitlements GoogleRemote/GoogleRemote.entitlements \
-      --sign - "$STAGED"
-  fi
+  # Bundle input-only zero-echo MoteFlowMic.driver inside app resources and sign
+  local sign_id
+  sign_id="$(resolve_sign_identity)"
+  bundle_and_sign_driver "$sign_id"
 }
 
 if has_xcodebuild; then
@@ -172,6 +208,12 @@ if has_xcodebuild; then
     CODE_SIGN_STYLE=Automatic \
     "CONFIGURATION_BUILD_DIR=$BUILD_DIR" \
     build
+  # Bundle input-only zero-echo MoteFlowMic.driver into Xcode-built app and re-sign bundle
+  SIGN_ID="$(codesign -dvv "$STAGED" 2>&1 | sed -n 's/^Authority=\(Apple Development:.*\)/\1/p' | head -n 1 || true)"
+  if [[ -z "$SIGN_ID" ]]; then
+    SIGN_ID="$(resolve_sign_identity)"
+  fi
+  bundle_and_sign_driver "$SIGN_ID"
 else
   build_with_command_line_tools
 fi

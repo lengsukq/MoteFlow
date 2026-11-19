@@ -90,6 +90,7 @@ final class HIDCaptureManager: ObservableObject {
             UserDefaults.standard.set(executeHardwareActions, forKey: Self.actionsKey)
             if !executeHardwareActions {
                 onAbortMappedActions?()
+                cancelAllPendingTaps()
                 cancelAllLiveHolds()
             }
         }
@@ -107,6 +108,8 @@ final class HIDCaptureManager: ObservableObject {
     var onVoiceSessionEnd: (() -> Void)?
     private var atvvVoiceActive = false
     var longPressThresholdForKey: ((RemoteKey) -> Double)?
+    var shouldRecognizeDoubleTap: ((RemoteKey) -> Bool)?
+    var doubleTapWindowForKey: ((RemoteKey) -> Double)?
 
     private var device: IOHIDDevice?
     private var buffer: UnsafeMutablePointer<UInt8>?
@@ -116,6 +119,7 @@ final class HIDCaptureManager: ObservableObject {
     private var xiaomiLearningPresses: Set<RemoteKey> = []
     private var liveHoldTasks: [RemoteKey: Task<Void, Never>] = [:]
     private var liveHoldsStarted: Set<RemoteKey> = []
+    private var pendingTapTasks: [RemoteKey: Task<Void, Never>] = [:]
     private var flashTask: Task<Void, Never>?
     private var suppressNextRelease = false
     private static let autoKey = "GoogleRemote.autoSeizeOnLaunch.v1"
@@ -391,6 +395,7 @@ final class HIDCaptureManager: ObservableObject {
 
     func stop(reason: String = "已停止监听，HID 独占已释放") {
         onAbortMappedActions?()
+        cancelAllPendingTaps()
         cancelAllLiveHolds()
         var releaseFailure: String?
         if let device {
@@ -497,6 +502,7 @@ final class HIDCaptureManager: ObservableObject {
             hardwareEventSequence += 1
             lastHardwareFeedback = "小米遥控器实体按下「\(key.title)」· HID Usage"
             activePhysicalKey = key
+            flushPendingTaps(except: key)
             if isLearning {
                 xiaomiLearningPresses.insert(key)
                 learningKey = nil
@@ -527,7 +533,7 @@ final class HIDCaptureManager: ObservableObject {
         if wasLearningPress { return }
         if completePhysicalHoldIfNeeded(for: key, gesture: gesture, started: liveHoldWasStarted) { return }
         if learningKey == nil && executeHardwareActions {
-            onMappedGesture?(key, gesture)
+            dispatchCompletedPress(key: key, gesture: gesture, feedbackPrefix: "小米实体「\(key.title)」")
         }
     }
 
@@ -578,7 +584,7 @@ final class HIDCaptureManager: ObservableObject {
                                                     started: liveHoldWasStarted) {
                 // Live hold completed.
             } else if learningKey == nil && executeHardwareActions {
-                onMappedGesture?(pressedKey, gesture)
+                dispatchCompletedPress(key: pressedKey, gesture: gesture, feedbackPrefix: "实体\(pressedKey.title)")
             }
             return
         }
@@ -610,6 +616,7 @@ final class HIDCaptureManager: ObservableObject {
             return
         }
         if matchesLearnedDevice, let key = learnedCodes.first(where: { $0.value == signal })?.key {
+            flushPendingTaps(except: key)
             activePhysicalKey = key
             highlightedPhysicalKey = key
             flashTask?.cancel()
@@ -619,6 +626,44 @@ final class HIDCaptureManager: ObservableObject {
             activePhysicalKey = nil
             lastHardwareFeedback = "收到未学习硬件码 \(signal.code)（Report \(signal.reportID)）"
         }
+    }
+
+    private func dispatchCompletedPress(key: RemoteKey, gesture: RemoteGesture, feedbackPrefix: String) {
+        flushPendingTaps(except: key)
+        guard gesture == .tap, shouldRecognizeDoubleTap?(key) == true else {
+            pendingTapTasks.removeValue(forKey: key)?.cancel()
+            onMappedGesture?(key, gesture)
+            return
+        }
+        if let pending = pendingTapTasks.removeValue(forKey: key) {
+            pending.cancel()
+            lastHardwareFeedback = "\(feedbackPrefix) · 双击"
+            onMappedGesture?(key, .doubleTap)
+            return
+        }
+        let window = min(0.60, max(0.15, doubleTapWindowForKey?(key) ?? 0.28))
+        pendingTapTasks[key] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(window))
+            guard !Task.isCancelled, let self, self.isCapturing,
+                  self.executeHardwareActions, self.learningKey == nil else { return }
+            self.pendingTapTasks.removeValue(forKey: key)
+            self.onMappedGesture?(key, .tap)
+        }
+    }
+
+    private func flushPendingTaps(except activeKey: RemoteKey) {
+        let otherKeys = pendingTapTasks.keys.filter { $0 != activeKey }
+        for other in otherKeys {
+            pendingTapTasks.removeValue(forKey: other)?.cancel()
+            if executeHardwareActions && learningKey == nil {
+                onMappedGesture?(other, .tap)
+            }
+        }
+    }
+
+    private func cancelAllPendingTaps() {
+        for task in pendingTapTasks.values { task.cancel() }
+        pendingTapTasks.removeAll()
     }
 
     private func scheduleLiveHold(for key: RemoteKey) {
@@ -634,6 +679,7 @@ final class HIDCaptureManager: ObservableObject {
             let stillPressed = self.xiaomiPresses[key] != nil ||
                 (self.currentPress?.code == self.learnedCodes[key])
             guard stillPressed else { return }
+            self.pendingTapTasks.removeValue(forKey: key)?.cancel()
             if self.onMappedHoldStart?(key) == true { self.liveHoldsStarted.insert(key) }
         }
     }
@@ -649,6 +695,7 @@ final class HIDCaptureManager: ObservableObject {
     private func completePhysicalHoldIfNeeded(for key: RemoteKey, gesture: RemoteGesture,
                                                started: Bool) -> Bool {
         guard gesture == .longPress, shouldFollowPhysicalHold?(key) == true else { return false }
+        pendingTapTasks.removeValue(forKey: key)?.cancel()
         if !started && executeHardwareActions && learningKey == nil,
            onMappedHoldStart?(key) == true {
             onMappedHoldEnd?(key)
