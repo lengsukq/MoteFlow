@@ -27,7 +27,7 @@ struct GoogleRemoteApp: App {
         }
         .defaultSize(width: 1180, height: 800)
 
-        MenuBarExtra("MoteFlow", image: "MoteFlowStatusIcon") {
+        MenuBarExtra {
             RemoteMenuBarContent(
                 runtime: runtime,
                 bluetooth: bluetooth,
@@ -35,7 +35,39 @@ struct GoogleRemoteApp: App {
                 actionRunner: actionRunner,
                 lanRelay: lanRelay
             )
+        } label: {
+            RemoteMenuBarIcon(lanRelay: lanRelay)
         }
+    }
+}
+
+private struct RemoteMenuBarIcon: View {
+    @ObservedObject var lanRelay: RemoteLANRelayManager
+
+    private var iconName: String {
+        if lanRelay.isRemoteMacActiveControlTarget {
+            return "MoteFlowStatusIconRemote"
+        }
+        if lanRelay.isControlledByPeer {
+            return "MoteFlowStatusIconControlled"
+        }
+        return "MoteFlowStatusIcon"
+    }
+
+    private var accessibilityTitle: String {
+        if lanRelay.isRemoteMacActiveControlTarget {
+            return "MoteFlow（当前控制远端 Mac）"
+        }
+        if lanRelay.isControlledByPeer {
+            return "MoteFlow（本机正接收远端遥控）"
+        }
+        return "MoteFlow（当前控制本机）"
+    }
+
+    var body: some View {
+        Image(iconName)
+            .renderingMode(.template)
+            .accessibilityLabel(accessibilityTitle)
     }
 }
 
@@ -59,12 +91,12 @@ private struct RemoteMenuBarContent: View {
             systemImage: hidCapture.isExclusive ? "checkmark.shield.fill" : "keyboard"
         )
         Label(
-            lanRelay.isForwardingToRemoteMac
-                ? "当前控制：远端「\(lanRelay.connectedPeerName ?? "另一台 Mac")」"
+            lanRelay.isRemoteMacActiveControlTarget
+                ? "当前控制：远端 Mac"
                 : lanRelay.isControlledByPeer
-                    ? "正在接收来自「\(lanRelay.controllingPeerName ?? "主控 Mac")」的操作"
-                    : "当前控制：本机「\(lanRelay.localPeerName)」",
-            systemImage: lanRelay.isForwardingToRemoteMac ? "macbook.and.ipad" : "desktopcomputer"
+                    ? "当前控制：本机（接收远端转发）"
+                    : "当前控制：本机",
+            systemImage: lanRelay.isRemoteMacActiveControlTarget ? "macbook.and.ipad" : "desktopcomputer"
         )
         Label(
             bluetooth.isRecording ? "语音：正在采集录音" :
@@ -79,31 +111,30 @@ private struct RemoteMenuBarContent: View {
 
         if lanRelay.isConnected {
             Button(
-                lanRelay.activeTarget == .remoteMac
-                    ? "切回控制「\(lanRelay.localPeerName)」(\(lanRelay.switchShortcut.display))"
-                    : "切换控制「\(lanRelay.connectedPeerName ?? "另一台 Mac")」(\(lanRelay.switchShortcut.display))"
+                lanRelay.isRemoteMacActiveControlTarget
+                    ? "切回控制本机 (\(lanRelay.switchShortcut.display))"
+                    : "切换控制远端 Mac (\(lanRelay.switchShortcut.display))"
             ) {
-                lanRelay.toggleTarget(showHUD: true)
+                lanRelay.switchControlFocus(toLocalMac: !lanRelay.isLocalMacActiveControlTarget, showHUD: true)
             }
 
             Menu("双机键位生效方案（当前：\(lanRelay.activeMappingOwnerName)）") {
-                let peerLabel = lanRelay.connectedPeerName ?? "另一台 Mac"
                 Button {
                     lanRelay.setMappingFollowSource(.followLocalMac)
                 } label: {
                     if lanRelay.localMappingFollowSource == .followLocalMac {
-                        Label("套用「\(lanRelay.localPeerName)」的键位方案", systemImage: "checkmark")
+                        Label("套用本机键位方案", systemImage: "checkmark")
                     } else {
-                        Text("套用「\(lanRelay.localPeerName)」的键位方案")
+                        Text("套用本机键位方案")
                     }
                 }
                 Button {
                     lanRelay.setMappingFollowSource(.followRemoteMac)
                 } label: {
                     if lanRelay.localMappingFollowSource == .followRemoteMac {
-                        Label("套用「\(peerLabel)」的键位方案", systemImage: "checkmark")
+                        Label("套用远端键位方案", systemImage: "checkmark")
                     } else {
-                        Text("套用「\(peerLabel)」的键位方案")
+                        Text("套用远端键位方案")
                     }
                 }
             }

@@ -123,6 +123,103 @@ struct BlackHoleDriverManagementCard: View {
     }
 }
 
+/// Primary zero-echo input-only virtual microphone driver card (`MoteFlowMic.driver`).
+struct MoteFlowMicDriverCard: View {
+    @ObservedObject var router: RemoteVirtualMicrophoneRouter
+    @StateObject private var manager = MoteFlowMicDriverManager()
+    @State private var confirmInstall = false
+    @State private var confirmUninstall = false
+
+    var body: some View {
+        RemoteCard {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 10) {
+                    RemoteSectionTitle(
+                        title: "MoteFlow Mic · 纯输入零回声虚拟麦克风（推荐）",
+                        subtitle: "无音频输出流，直接将遥控器语音推入麦克风，彻底消除 macOS 屏幕共享回声且无需静音扬声器",
+                        symbol: "mic.badge.plus"
+                    )
+                    Spacer(minLength: 8)
+                    RemoteStatusPill(
+                        title: manager.isLoaded ? "已就绪 · 零回声" :
+                            (manager.driverOnDisk ? "待刷新" : "未安装"),
+                        symbol: manager.isLoaded ? "checkmark.seal.fill" : "circle.dotted",
+                        tint: manager.isLoaded ? RemotePalette.positive : RemotePalette.indigo
+                    )
+                }
+
+                HStack(spacing: 8) {
+                    Image(systemName: manager.isLoaded ? "checkmark.circle.fill" : "info.circle")
+                        .foregroundStyle(manager.isLoaded ? RemotePalette.positive : RemotePalette.indigo)
+                    Text(manager.statusMessage)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                HStack(spacing: 9) {
+                    Button {
+                        manager.refresh(using: router)
+                    } label: {
+                        Label("重新检测", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(RemoteActionButtonStyle())
+
+                    if !manager.isLoaded {
+                        Button("一键安装 MoteFlow Mic", systemImage: "arrow.down.circle.fill") {
+                            confirmInstall = true
+                        }
+                        .buttonStyle(RemoteActionButtonStyle(emphasized: true))
+                        .disabled(manager.bundledDriverPath == nil)
+                    } else {
+                        if !router.isUsingDirectPushMic {
+                            Button("立即切换使用 MoteFlow Mic", systemImage: "checkmark.circle") {
+                                router.selectedUID = MoteFlowMicDriverManager.deviceUID
+                                router.isEnabled = true
+                            }
+                            .buttonStyle(RemoteActionButtonStyle(emphasized: true))
+                        }
+                        Button("卸载驱动", systemImage: "trash") {
+                            confirmUninstall = true
+                        }
+                        .buttonStyle(RemoteActionButtonStyle())
+                    }
+                    Spacer(minLength: 0)
+                }
+
+                if let message = manager.lastCommandMessage {
+                    Label(message, systemImage: "terminal")
+                        .font(.system(size: 11))
+                        .foregroundStyle(RemotePalette.indigo)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .onAppear {
+            manager.refresh(using: router)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            manager.refresh(using: router)
+        }
+        .confirmationDialog("安装 MoteFlow Mic 纯输入虚拟麦克风？", isPresented: $confirmInstall) {
+            Button("打开终端安装") {
+                manager.launch(.install, router: router)
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将内置 MoteFlowMic.driver 拷贝到 /Library/Audio/Plug-Ins/HAL/ 并重启 CoreAudio 服务（无需重启电脑，需输入一次管理员密码）。")
+        }
+        .confirmationDialog("卸载 MoteFlow Mic？", isPresented: $confirmUninstall) {
+            Button("停止路由并打开终端卸载", role: .destructive) {
+                manager.launch(.uninstall, router: router)
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将从 /Library/Audio/Plug-Ins/HAL/ 移除 MoteFlowMic.driver 并重启 CoreAudio。")
+        }
+    }
+}
+
 /// Streamlined UI panel for configuring push-to-talk virtual microphone routing and anti-echo protection.
 struct RemoteVirtualMicrophoneSettings: View {
     @ObservedObject var router: RemoteVirtualMicrophoneRouter
@@ -133,6 +230,8 @@ struct RemoteVirtualMicrophoneSettings: View {
                 RemoteOutputEchoWarningBanner(router: router)
             }
 
+            MoteFlowMicDriverCard(router: router)
+
             BlackHoleDriverManagementCard(router: router)
 
             RemoteCard {
@@ -140,7 +239,9 @@ struct RemoteVirtualMicrophoneSettings: View {
                     HStack(spacing: 10) {
                         RemoteSectionTitle(
                             title: "遥控器虚拟麦克风与防回音保护",
-                            subtitle: "ATVV PCM → BlackHole 输出 → 豆包麦克风输入（内置屏幕共享防回音静音）",
+                            subtitle: router.isUsingDirectPushMic
+                                ? "ATVV PCM → CoreAudio 直推 → MoteFlow Mic 纯输入（零输出流 · 无屏幕共享回声）"
+                                : "ATVV PCM → BlackHole 输出 → 豆包麦克风输入（内置屏幕共享防回音静音）",
                             symbol: "waveform"
                         )
                         Spacer(minLength: 0)
@@ -151,20 +252,21 @@ struct RemoteVirtualMicrophoneSettings: View {
                     }
 
                     if router.devices.isEmpty {
-                        Label("没有发现 BlackHole 等虚拟音频驱动。若要喂给豆包语音，请先在上方一键安装 BlackHole 2ch。",
+                        Label("没有发现虚拟音频驱动。推荐在上方一键安装内置 MoteFlow Mic（纯输入零回声），或使用 BlackHole 2ch。",
                               systemImage: "exclamationmark.circle")
                             .font(.system(size: 12))
                             .foregroundStyle(RemotePalette.amber)
-                        Link("BlackHole 官方安装说明", destination:
-                                URL(string: "https://github.com/ExistentialAudio/BlackHole")!)
-                            .font(.system(size: 12))
                     } else {
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 9)], spacing: 9) {
                             ForEach(router.devices) { device in
                                 RemoteVisualOption(
                                     title: device.name,
-                                    subtitle: "专用音频输出 → 同名麦克风输入",
-                                    symbol: "waveform.badge.mic",
+                                    subtitle: MoteFlowMicDriverManager.isDirectPushDevice(device.id)
+                                        ? "纯输入直推 · 零屏幕共享回声"
+                                        : "环回输出 → 同名麦克风输入",
+                                    symbol: MoteFlowMicDriverManager.isDirectPushDevice(device.id)
+                                        ? "mic.badge.plus"
+                                        : "waveform.badge.mic",
                                     selected: router.selectedUID == device.id,
                                     compact: true,
                                     action: { router.selectedUID = device.id }
@@ -177,10 +279,17 @@ struct RemoteVirtualMicrophoneSettings: View {
                                       !router.devices.contains(where: { $0.id == router.selectedUID }))
                     }
 
-                    Toggle("按住语音说话期间自动静音扬声器（消除 macOS 屏幕共享回音，松开即恢复）",
-                           isOn: $router.suppressSpeakerEchoDuringVoice)
-                        .toggleStyle(.switch)
-                        .font(.system(size: 12, weight: .medium))
+                    if !router.isUsingDirectPushMic {
+                        Toggle("按住语音说话期间自动静音扬声器（消除 macOS 屏幕共享回音，松开即恢复）",
+                               isOn: $router.suppressSpeakerEchoDuringVoice)
+                            .toggleStyle(.switch)
+                            .font(.system(size: 12, weight: .medium))
+                    } else {
+                        Label("当前使用 MoteFlow Mic 纯输入通道：无任何音频输出流，屏幕共享天然零回声，无需静音扬声器。",
+                              systemImage: "checkmark.shield.fill")
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(RemotePalette.positive)
+                    }
 
                     HStack(spacing: 9) {
                         Image(systemName: router.isRouting ? "waveform" : "info.circle")

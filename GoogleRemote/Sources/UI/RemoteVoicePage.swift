@@ -69,6 +69,7 @@ struct RemoteVoicePage: View {
 
     private var antiEchoReady: Bool {
         let router = bluetooth.virtualMicrophone
+        if router.isUsingDirectPushMic { return true }
         return router.suppressSpeakerEchoDuringVoice && !router.outputPointedToVirtualMic
     }
 
@@ -131,7 +132,7 @@ struct RemoteVoicePage: View {
                     Spacer()
                     if lanRelay.isForwardingToRemoteMac {
                         RemoteStatusPill(
-                            title: "双机语音实时转发至：\(lanRelay.connectedPeerName ?? "远端 Mac")",
+                            title: "双机语音实时转发至远端 Mac",
                             symbol: "macbook.and.ipad",
                             tint: RemotePalette.turquoise
                         )
@@ -161,8 +162,8 @@ struct RemoteVoicePage: View {
         healthStepPill(
             step: "2. 语音应用通道",
             status: virtualDeviceReady && voiceShortcutReady
-                ? "BlackHole + 热键已就绪"
-                : (!virtualDeviceReady ? "可选：免驱离线或配声卡" : "待绑定唤起热键"),
+                ? (bluetooth.virtualMicrophone.isUsingDirectPushMic ? "MoteFlow Mic 直推已就绪" : "BlackHole + 热键已就绪")
+                : (!virtualDeviceReady ? "可选：装 MoteFlow Mic 或离线" : "待绑定唤起热键"),
             ready: virtualDeviceReady && voiceShortcutReady,
             buttonTitle: !virtualDeviceReady ? "配置声卡" : "绑定热键"
         ) {
@@ -175,7 +176,9 @@ struct RemoteVoicePage: View {
 
         healthStepPill(
             step: "3. 屏幕共享防回音",
-            status: antiEchoReady ? "说话自动静音扬声器" : "点击一键修复防回音",
+            status: bluetooth.virtualMicrophone.isUsingDirectPushMic
+                ? "纯输入直推 · 零回声"
+                : (antiEchoReady ? "说话自动静音扬声器" : "点击一键修复防回音"),
             ready: antiEchoReady,
             buttonTitle: "一键开启"
         ) {

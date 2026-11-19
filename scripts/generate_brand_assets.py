@@ -110,6 +110,23 @@ def draw_icon(size, path):
     write_bitmap(rep, path)
 
 
+def arrow(start, end, head_a, head_b, paint, thickness):
+    shaft = NSBezierPath.bezierPath()
+    shaft.moveToPoint_(NSMakePoint(*start))
+    shaft.lineToPoint_(NSMakePoint(*end))
+    shaft.setLineCapStyle_(1)  # round
+    shaft.setLineJoinStyle_(1)  # round
+    stroke(shaft, paint, thickness)
+
+    head = NSBezierPath.bezierPath()
+    head.moveToPoint_(NSMakePoint(*head_a))
+    head.lineToPoint_(NSMakePoint(*end))
+    head.lineToPoint_(NSMakePoint(*head_b))
+    head.setLineCapStyle_(1)  # round
+    head.setLineJoinStyle_(1)  # round
+    stroke(head, paint, thickness)
+
+
 def draw_status(size, path):
     """Make a true 18pt menu-bar template from the approved logo's motif.
 
@@ -133,9 +150,66 @@ def draw_status(size, path):
     write_bitmap(rep, path)
 
 
+def draw_status_remote(size, path):
+    """18pt menu-bar template when forwarding control to a remote Mac.
+
+    Uses a hollow outlined remote silhouette paired with an outgoing top-right
+    arrow so the user can tell at a glance that focus is on the other Mac.
+    """
+    rep = canvas(size)
+    monochrome = NSColor.blackColor()
+    outline = rounded(135, 105, 366, 566, 140)
+    stroke(outline, monochrome, 76)
+    # Primary D-pad dot + two lower buttons keep the remote silhouette clear at 18pt.
+    fill(ellipse(255, 442, 126, 126), monochrome)
+    fill(ellipse(238, 240, 56, 56), monochrome)
+    fill(ellipse(342, 240, 56, 56), monochrome)
+    # Outgoing arrow pointing top-right (control forwarded out to remote Mac).
+    arrow((595, 595), (895, 895), (655, 895), (895, 655), monochrome, 84)
+    write_bitmap(rep, path)
+
+
+def draw_status_controlled(size, path):
+    """18pt menu-bar template when this Mac is being controlled by a peer Mac.
+
+    Uses the solid remote silhouette paired with an incoming top-right arrow
+    pointing into the remote to indicate incoming peer control.
+    """
+    rep = canvas(size)
+    monochrome = NSColor.blackColor()
+    body = NSBezierPath.bezierPath()
+    body.setWindingRule_(NSEvenOddWindingRule)
+    body.appendBezierPath_(rounded(112, 86, 392, 594, 148))
+    body.appendBezierPath_(ellipse(238, 466, 140, 140))
+    for x in (232, 344):
+        for y in (238, 318):
+            body.appendBezierPath_(ellipse(x, y, 42, 42))
+    fill(body, monochrome)
+    # Incoming arrow pointing bottom-left toward the remote body.
+    arrow((895, 895), (595, 595), (595, 835), (835, 595), monochrome, 84)
+    write_bitmap(rep, path)
+
+
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+
+
+def write_status_imageset(name, prefix, drawer):
+    imageset = CATALOG / f"{name}.imageset"
+    status_images = []
+    for scale in (1, 2, 3):
+        filename = f"{prefix}-{scale}x.png"
+        drawer(18 * scale, imageset / filename)
+        status_images.append({
+            "idiom": "universal", "filename": filename, "scale": f"{scale}x",
+        })
+    write_json(imageset / "Contents.json", {
+        "images": status_images,
+        "info": {"author": "xcode", "version": 1},
+        "properties": {"template-rendering-intent": "template"},
+    })
+    return imageset
 
 
 def main():
@@ -165,25 +239,15 @@ def main():
         "info": {"author": "xcode", "version": 1},
     })
 
-    status = CATALOG / "MoteFlowStatusIcon.imageset"
     # 18 pt is the intended AppKit menu-bar size. Using a lone 64px 1x asset
     # gave the icon a 64pt intrinsic size and made it look oversized/cropped.
-    status_images = []
-    for scale in (1, 2, 3):
-        filename = f"mote-flow-status-{scale}x.png"
-        draw_status(18 * scale, status / filename)
-        status_images.append({
-            "idiom": "universal", "filename": filename, "scale": f"{scale}x",
-        })
+    status = write_status_imageset("MoteFlowStatusIcon", "mote-flow-status", draw_status)
     (status / "mote-flow-status.png").unlink(missing_ok=True)
-    write_json(status / "Contents.json", {
-        "images": status_images,
-        "info": {"author": "xcode", "version": 1},
-        "properties": {"template-rendering-intent": "template"},
-    })
+    write_status_imageset("MoteFlowStatusIconRemote", "mote-flow-status-remote", draw_status_remote)
+    write_status_imageset("MoteFlowStatusIconControlled", "mote-flow-status-controlled", draw_status_controlled)
     print(f"Approved source: {SOURCE_ICON.name}")
     print(f"Source SHA256: {hashlib.sha256(SOURCE_ICON.read_bytes()).hexdigest()}")
-    print(f"Generated MoteFlow icon set, brand mark and menu-bar glyph in {CATALOG}")
+    print(f"Generated MoteFlow icon set, brand mark and menu-bar glyphs in {CATALOG}")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ struct RemoteMappingPage: View {
     var onOpenConnection: (() -> Void)? = nil
 
     @EnvironmentObject private var runner: RemoteActionRunner
+    @EnvironmentObject private var lanRelay: RemoteLANRelayManager
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var editingGesture: RemoteGesture = .tap
@@ -71,6 +72,9 @@ struct RemoteMappingPage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
+            if lanRelay.isUsingPeerMappingForSession {
+                borrowedPeerMappingBanner
+            }
             starterScenesAndModelBar
             RemoteMappingProfileToolbar(store: store)
 
@@ -170,6 +174,30 @@ struct RemoteMappingPage: View {
             Button("确定") { fileError = nil }
         } message: {
             Text(fileError ?? "未知错误")
+        }
+    }
+
+    // MARK: - Active Session Peer-Mapping Borrow Banner
+
+    private var borrowedPeerMappingBanner: some View {
+        RemoteCard(padding: 12) {
+            HStack(spacing: 10) {
+                Image(systemName: "memorychip")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(RemotePalette.indigo)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("当前联机正在复用「\(lanRelay.activeMappingOwnerName)」的键位方案")
+                        .font(.system(size: 12.5, weight: .semibold))
+                    Text("联机期间按对端标准执行且不覆盖本机配置；断开联机后自动恢复下方本机配置。")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Button("切回本机方案") {
+                    lanRelay.setMappingFollowSource(.followLocalMac)
+                }
+                .buttonStyle(RemoteActionButtonStyle())
+            }
         }
     }
 
@@ -404,7 +432,7 @@ struct RemoteMappingPage: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(selected.title)
                     .font(.system(size: 18, weight: .bold, design: .rounded))
-                Text("\(selected.location) · 单击和长按可分别绑定不同动作")
+                Text("\(selected.location) · 单击、双击和长按可分别绑定不同动作")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -423,14 +451,22 @@ struct RemoteMappingPage: View {
         VStack(alignment: .leading, spacing: 9) {
             Text("1. 选择触发手势")
                 .font(.system(size: 12, weight: .semibold))
-            HStack(spacing: 9) {
+            HStack(spacing: 8) {
                 RemoteVisualOption(
-                    title: "短按（单击）",
+                    title: "单击",
                     subtitle: library.description(for: binding.action(for: .tap)),
                     symbol: "hand.tap",
                     selected: editingGesture == .tap,
                     compact: true,
                     action: { editingGesture = .tap }
+                )
+                RemoteVisualOption(
+                    title: "双击",
+                    subtitle: library.description(for: binding.action(for: .doubleTap)),
+                    symbol: "hand.tap.fill",
+                    selected: editingGesture == .doubleTap,
+                    compact: true,
+                    action: { editingGesture = .doubleTap }
                 )
                 RemoteVisualOption(
                     title: "长按",
@@ -440,6 +476,27 @@ struct RemoteMappingPage: View {
                     compact: true,
                     action: { editingGesture = .longPress }
                 )
+            }
+
+            if editingGesture == .doubleTap {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 10) {
+                        Text("双击连击窗口")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Slider(value: Binding(
+                            get: { binding.effectiveDoubleTapWindow },
+                            set: { store.setDoubleTapWindow($0, for: selected) }
+                        ), in: 0.15...0.60, step: 0.02)
+                        Text(String(format: "%.2f 秒", binding.effectiveDoubleTapWindow))
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(RemotePalette.indigo)
+                            .frame(width: 52, alignment: .trailing)
+                    }
+                    Text("未配置双击动作时，单击保持 0 延迟即时触发。")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
             }
 
             if editingGesture == .longPress {
@@ -788,7 +845,7 @@ struct RemoteMappingPage: View {
                                     Text(key.title)
                                         .font(.system(size: 11, weight: .semibold))
                                         .foregroundStyle(.primary)
-                                    Text(library.description(for: current.action(for: .tap)))
+                                    Text(quickGridSummary(for: current))
                                         .font(.system(size: 10))
                                         .foregroundStyle(.secondary)
                                         .lineLimit(1)
@@ -820,6 +877,16 @@ struct RemoteMappingPage: View {
     }
 
     // MARK: - Helpers
+
+    private func quickGridSummary(for binding: RemoteBinding) -> String {
+        let tap = binding.action(for: .tap)
+        if tap.kind != .none { return library.description(for: tap) }
+        let doubleTap = binding.action(for: .doubleTap)
+        if doubleTap.kind != .none { return "双击：\(library.description(for: doubleTap))" }
+        let longPress = binding.action(for: .longPress)
+        if longPress.kind != .none { return "长按：\(library.description(for: longPress))" }
+        return "未配置"
+    }
 
     private func runCurrentActionTest() {
         let selectedAction = store.action(for: selected, gesture: editingGesture)

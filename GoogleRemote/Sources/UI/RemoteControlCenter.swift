@@ -34,7 +34,7 @@ enum RemotePage: String, CaseIterable, Identifiable {
         switch self {
         case .remote: "按手中实体键自动高亮选中，右侧即刻修改单击与长按功能并当场验证"
         case .voice: "一键接入豆包 AI 语音或开启免驱动离线语音打字，内置屏幕共享防回音静音"
-        case .dualMac: "一个遥控器无缝控制两台 Mac，支持已配对自动重连与直观真机方案切换"
+        case .dualMac: "两台 Mac 共用一个遥控器"
         case .settings: "管理自动接管生效、菜单栏轻量模式、本机历史快照与统一 JSON 全量备份"
         case .permissions: "集中检查 macOS 核心权限与按需扩展能力，支持一键请求或跳转系统设置"
         case .diagnostics: "统一查看按键 HID、蓝牙语音与双机网络日志，按需采样未知遥控器硬件码"
@@ -378,13 +378,13 @@ struct ContentView: View {
             )
 
             Label(
-                lanRelay.isForwardingToRemoteMac
-                    ? "正在控制：\(lanRelay.connectedPeerName ?? "远端 Mac")"
-                    : (lanRelay.isConnected ? "双机已连 · 控制「\(lanRelay.localPeerName)」" : "单机模式 · \(lanRelay.localPeerName)"),
-                systemImage: lanRelay.isForwardingToRemoteMac ? "macbook.and.ipad" : "desktopcomputer"
+                lanRelay.isRemoteMacActiveControlTarget
+                    ? "正在控制：远端 Mac"
+                    : (lanRelay.isConnected ? "双机已连 · 控制本机" : "单机模式 · 本机"),
+                systemImage: lanRelay.isRemoteMacActiveControlTarget ? "macbook.and.ipad" : "desktopcomputer"
             )
             .font(.system(size: 11, weight: .medium))
-            .foregroundStyle(lanRelay.isForwardingToRemoteMac ? RemotePalette.turquoise : .secondary)
+            .foregroundStyle(lanRelay.isRemoteMacActiveControlTarget ? RemotePalette.turquoise : .secondary)
             .lineLimit(1)
 
             Button {
@@ -513,14 +513,14 @@ struct ContentView: View {
 
             if lanRelay.isConnected {
                 Button {
-                    lanRelay.toggleTarget(showHUD: true)
+                    lanRelay.switchControlFocus(toLocalMac: !lanRelay.isLocalMacActiveControlTarget, showHUD: true)
                 } label: {
                     RemoteStatusPill(
-                        title: lanRelay.isForwardingToRemoteMac
-                            ? "正在控制：\(lanRelay.connectedPeerName ?? "远端 Mac") ⇄"
-                            : "控制：\(lanRelay.localPeerName) ⇄",
-                        symbol: lanRelay.isForwardingToRemoteMac ? "macbook.and.ipad" : "desktopcomputer",
-                        tint: lanRelay.isForwardingToRemoteMac ? RemotePalette.turquoise : RemotePalette.indigo
+                        title: lanRelay.isRemoteMacActiveControlTarget
+                            ? "控制：远端 Mac ⇄"
+                            : "控制：本机 ⇄",
+                        symbol: lanRelay.isRemoteMacActiveControlTarget ? "macbook.and.ipad" : "desktopcomputer",
+                        tint: lanRelay.isRemoteMacActiveControlTarget ? RemotePalette.turquoise : RemotePalette.indigo
                     )
                 }
                 .buttonStyle(.plain)

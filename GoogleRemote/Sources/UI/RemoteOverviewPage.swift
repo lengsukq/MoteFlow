@@ -131,7 +131,7 @@ struct RemoteOverviewPage: View {
 
         channelCard(
             title: "3. 第二台 Mac 共享",
-            status: lanRelay.isConnected ? "已连：\(lanRelay.connectedPeerName ?? "远端 Mac")" : "支持局域网自动配对",
+            status: lanRelay.isConnected ? "双机已连通" : "支持局域网自动配对",
             detail: "另一台 Mac 无需再连蓝牙，同一局域网下点击确认配对即可按快捷键切换控制。",
             symbol: "macbook.and.ipad",
             ready: lanRelay.isConnected,
