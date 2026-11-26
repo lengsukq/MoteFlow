@@ -48,6 +48,9 @@ struct RemoteSettingsPage: View {
                 configBackupAndExportCards
             }
         }
+        .onAppear {
+            runtime.refreshLaunchAtLoginStatus()
+        }
         .sheet(isPresented: Binding(
             get: { pendingConfigDocument != nil },
             set: { if !$0 { pendingConfigDocument = nil } }
@@ -133,7 +136,7 @@ struct RemoteSettingsPage: View {
     private var sectionOptionCards: some View {
         RemoteVisualOption(
             title: "日常运行与轻量常驻",
-            subtitle: "自动接管与菜单栏后台模式",
+            subtitle: "开机自启、自动接管与菜单栏后台模式",
             symbol: "gearshape",
             selected: section == .daily,
             compact: true,
@@ -156,10 +159,15 @@ struct RemoteSettingsPage: View {
         RemoteCard {
             VStack(alignment: .leading, spacing: 14) {
                 RemoteSectionTitle(
-                    title: "自动化与按键响应",
-                    subtitle: "打开软件后自动接管并生效已配对遥控器，无需每次手动连接",
+                    title: "开机自启与自动接管",
+                    subtitle: "管理开机自动启动，以及打开软件后自动接管已配对遥控器与语音通道",
                     symbol: "bolt.shield"
                 )
+
+                launchAtLoginSection
+
+                Divider().opacity(0.45)
+
                 Toggle("自动接管已配对遥控器并立即生效按键控制", isOn: Binding(
                     get: { monitor.isRemoteControlActive },
                     set: { monitor.setRemoteControlActive($0) }
@@ -240,6 +248,86 @@ struct RemoteSettingsPage: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(RemoteActionButtonStyle(emphasized: true))
+            }
+        }
+    }
+
+    // MARK: - Launch at Login Section
+
+    private var launchAtLoginTint: Color {
+        switch runtime.launchAtLoginStatus {
+        case .enabled: RemotePalette.positive
+        case .disabled: RemotePalette.indigo
+        case .requiresApproval, .unavailable: RemotePalette.amber
+        }
+    }
+
+    private var launchAtLoginGuidanceMessage: String? {
+        if let error = runtime.launchAtLoginErrorMessage {
+            return error
+        }
+        if runtime.launchAtLoginStatus.needsSystemSettingsApproval || runtime.launchAtLoginStatus == .unavailable {
+            return runtime.launchAtLoginStatus.detailMessage
+        }
+        return nil
+    }
+
+    @ViewBuilder
+    private var launchAtLoginSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 10) {
+                Toggle("登录 macOS 时自动启动 MoteFlow", isOn: Binding(
+                    get: { runtime.isLaunchAtLoginEnabled },
+                    set: { runtime.setLaunchAtLoginEnabled($0) }
+                ))
+                .toggleStyle(.switch)
+                .disabled(runtime.launchAtLoginStatus == .unavailable)
+
+                Spacer(minLength: 8)
+
+                RemoteStatusPill(
+                    title: runtime.launchAtLoginStatus.badgeTitle,
+                    symbol: runtime.launchAtLoginStatus.badgeSymbol,
+                    tint: launchAtLoginTint
+                )
+            }
+
+            if let guidance = launchAtLoginGuidanceMessage {
+                if runtime.launchAtLoginErrorMessage != nil {
+                    Text(runtime.launchAtLoginStatus.detailMessage)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack(alignment: .center, spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(RemotePalette.amber)
+                    Text(guidance)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.primary.opacity(0.86))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Button("打开登录项设置") {
+                        runtime.openLoginItemsSettings()
+                    }
+                    .buttonStyle(RemoteActionButtonStyle(emphasized: runtime.launchAtLoginStatus.needsSystemSettingsApproval))
+
+                    Button("刷新") {
+                        runtime.refreshLaunchAtLoginStatus()
+                    }
+                    .buttonStyle(RemoteActionButtonStyle())
+                }
+                .padding(10)
+                .background(RemotePalette.amber.opacity(0.09), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .strokeBorder(RemotePalette.amber.opacity(0.28), lineWidth: 1)
+                )
+            } else {
+                Text(runtime.launchAtLoginStatus.detailMessage)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

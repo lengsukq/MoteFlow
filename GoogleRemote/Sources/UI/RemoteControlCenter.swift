@@ -35,7 +35,7 @@ enum RemotePage: String, CaseIterable, Identifiable {
         case .remote: "按手中实体键自动高亮选中，右侧即刻修改单击与长按功能并当场验证"
         case .voice: "一键接入豆包 AI 语音或开启免驱动离线语音打字，内置屏幕共享防回音静音"
         case .dualMac: "两台 Mac 共用一个遥控器"
-        case .settings: "管理自动接管生效、菜单栏轻量模式、本机历史快照与统一 JSON 全量备份"
+        case .settings: "管理开机自启、自动接管生效、菜单栏轻量模式、本机历史快照与统一 JSON 全量备份"
         case .permissions: "集中检查 macOS 核心权限与按需扩展能力，支持一键请求或跳转系统设置"
         case .diagnostics: "统一查看按键 HID、蓝牙语音与双机网络日志，按需采样未知遥控器硬件码"
         }

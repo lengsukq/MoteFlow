@@ -165,6 +165,16 @@ private struct RemoteMenuBarContent: View {
                 runtime.openMainWindow { openWindow(id: "main") }
             }
         }
+        Toggle("开机自动启动", isOn: Binding(
+            get: { runtime.isLaunchAtLoginEnabled },
+            set: { runtime.setLaunchAtLoginEnabled($0, announceHUD: true) }
+        ))
+        .disabled(runtime.launchAtLoginStatus == .unavailable)
+        if runtime.launchAtLoginStatus.needsSystemSettingsApproval {
+            Button("在系统设置中允许开机自启…") {
+                runtime.openLoginItemsSettings()
+            }
+        }
         Divider()
         Button("彻底退出 MoteFlow") {
             actionRunner.endVoiceShortcutHold()

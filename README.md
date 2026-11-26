@@ -34,12 +34,12 @@ MoteFlow 是一款 **纯原生 Swift / SwiftUI macOS 应用**：将支持的蓝�
 | 可视化遥控器 | 自由绑定快捷键 |
 | :--- | :--- |
 | 使用可点击的遥控器图示测试高亮、配置单击与长按。Google 和小米拥有独立布局与配置。 | 支持单键、组合键以及左右 Command / Option / Control / Shift；可以录制或用可视化键盘设置。 |
-| **统一动作库** | **ATVV 语音与虚拟麦克风** |
-| 将「打开应用、发送快捷键、执行脚本、等待」组合成可复用动作。 | Google 遥控器的 ATVV 接收、PCM 解码与 BlackHole 2ch → 豆包语音输入已在一套真实环境下验证。 |
-| **多设备预设** | **菜单栏轻量运行** |
-| 不同型号分别保存动作；支持已知 HID 匹配、高级学习和 JSON 备份。 | 收起主窗口后继续监听，菜单栏可查看状态、暂停动作、重新打开设置。 |
-| **双 Mac 局域网同端口互联** | **3 步新手极速上手** |
-| 两台 Mac 打开同一软件自动发现、6 位核对码点击确认配对；按全局快捷键（默认 `⌃⌥⌘M`）或遥控器按钮无缝切换控制哪台电脑。 | 首页内置交互式三步向导，自动检测权限与动作生效状态，新手 30 秒即可完成配置。 |
+| **统一动作库与全量备份** | **ATVV 语音与零回声虚拟麦克风** |
+| 将「打开应用、发送快捷键、执行脚本、等待」组合成可复用动作；支持单文件 JSON 全量备份与本机历史快照一键回滚。 | 支持 Google 遥控器 ATVV 接收、PCM 解码，内置自研输入型 `MoteFlowMic.driver` 及 BlackHole 2ch 路由，并支持屏幕共享防回音静音。 |
+| **开机自启与菜单栏轻量常驻** | **双 Mac 局域网同端口互联** |
+| 支持 macOS 原生登录项（`SMAppService`）开机自动启动，可在设置页或菜单栏一键开关并自动同步系统设置；搭配菜单栏轻量模式可开机静默常驻，不占桌面与程序坞。 | 两台 Mac 打开同一软件自动发现、6 位核对码点击确认配对；按全局快捷键（默认 `⌃⌥⌘M`）或遥控器按钮无缝切换控制目标，支持三态菜单栏图标与主从键位方案跟随。 |
+| **多设备预设** | **3 步新手极速上手** |
+| 不同型号分别保存动作，连接实体遥控器时自动跟随真机型号；支持已知 HID 匹配与折叠式高级硬件码采样。 | 首页内置交互式三步向导与集中式权限体检，自动检测权限与动作生效状态，新手 30 秒即可完成配置。 |
 
 
 ## 支持的遥控器
@@ -79,14 +79,14 @@ xcodebuild -project GoogleRemote.xcodeproj \
   -scheme GoogleRemote -configuration Debug CODE_SIGNING_ALLOWED=NO build
 ```
 
-使用你的 Apple Developer Team ID 签名并安装到 `~/Applications`：
+使用你的 Apple Developer Team ID 签名并安装到应用程序目录（自动优先更新已有 `/Applications/MoteFlow.app`，否则安装到 `~/Applications`；也可用 `MOTEFLOW_INSTALL_DIR=/Applications` 指定路径）：
 
 ```bash
 MOTEFLOW_DEVELOPMENT_TEAM=YOUR_TEAM_ID \
   bash scripts/install_signed_mac.command
 ```
 
-> 默认只提供源代码，不保证有预编译的二进制安装包。签名、蓝牙及输入监控授权与用户本机环境有关。
+> 也可直接从 [GitHub Releases](https://github.com/lengsukq/MoteFlow/releases) 下载最新打包的 `MoteFlow-macOS.zip`（含内嵌 `MoteFlowMic.driver`）；因使用个人开发证书签名，若在其他 Mac 上首次打开受系统拦截，建议从源码通过 Xcode 构建或使用自己的证书签名安装。
 
 ### 第一次使用
 
@@ -99,7 +99,7 @@ MOTEFLOW_DEVELOPMENT_TEAM=YOUR_TEAM_ID \
    - **可命名的映射方案**：在「映射方案」区域选择「另存为新方案」，为当前工作副本命名。可切换同型号已保存方案、重命名或删除，并通过「保存当前修改」明确覆盖已命名快照。直接编辑不会自动覆盖快照；恢复出厂也不会删掉用户方案。映射方案按遥控器型号独立管理，旧版工作映射继续保留；已有 Google 用户需手动选择「恢复出厂映射」才能应用新的内置默认映射。
    - **macOS 快捷键预设**：快速绑定区域截图（⇧⌘4）、全屏截图（⇧⌘3）、复制（⌘C）、粘贴（⌘V）、撤销（⌘Z）等高频功能；「查看全部预设」可搜索截图、剪贴板、文本编辑、窗口与系统功能，共 22 项。点击预设只保存当前遥控器单击或长按映射，使用原有冲突确认机制，不会立即执行。仍可自定义录制快捷键。
    - **系统动作优先**：区域/全屏截图、截图与录屏工具栏以及截图到剪贴板直接调用 macOS 自带的 `screencapture`（保存时遵循系统截图默认设置），不模拟 ⇧⌘3 / ⇧⌘4。复制、粘贴、剪切、全选、撤销和重做优先使用当前前台 App 的无快捷键菜单辅助功能操作，需要「辅助功能」授权且只在 App 暴露相应菜单时可用；不自动回退到可能已被用户修改的按键组合。Spotlight、切换 App 等尚无统一稳定公开调用的动作保留快捷键绑定，并在预设中区分展示。既有用户映射保持原样，需要自行重新选择才能切换到系统调用。
-5. 在「设置」启用菜单栏轻量模式，可将窗口收起，不必保持控制台始终显示。
+5. 在「偏好与备份 → 日常运行与轻量常驻」（或右上角菜单栏）中可一键开启**登录 macOS 时自动启动**与**菜单栏轻量模式**：开启后每次登录 macOS 自动在后台接管遥控器并静默常驻菜单栏，且与「系统设置 → 通用 → 登录项与扩展」保持实时同步。
 
 ## 语音输入
 
@@ -152,30 +152,37 @@ flowchart LR
 
 | 组件 | 技术 |
 | :-- | :-- |
-| 界面和菜单栏 | SwiftUI、AppKit |
+| 界面和菜单栏 | SwiftUI、AppKit、ServiceManagement（`SMAppService` 开机自启） |
 | 蓝牙及 ATVV | CoreBluetooth、ADPCM 解码 |
 | 按键采样 | IOKit / IOHIDManager |
 | 快捷键与动作 | CoreGraphics、原生进程 |
-| 音频路由 | CoreAudio AudioQueue、BlackHole |
+| 音频路由 | CoreAudio AudioQueue、内置 `MoteFlowMic.driver` / BlackHole |
+| 双机互联 | Network.framework、Bonjour、加密帧中继 |
 | 自动测试 | Swift Package Manager / XCTest |
 
 ```bash
 swift test
 ```
 
-当前代码包含协议处理、按键映射、设备预设、动作库和 PCM 转换的测试。**单元测试通过不等同于 HID 独占、音频设备切换或实体遥控器端到端验收通过。**
+当前代码包含协议处理、按键映射、设备预设、动作库、语音状态机、局域网中继、开机自启与 PCM 转换的测试。**单元测试通过不等同于 HID 独占、音频设备切换或实体遥控器端到端验收通过。**
 
 ### 项目结构
 
 ```text
 GoogleRemote/
-  Assets.xcassets/       AppIcon、菜单栏图标与品牌资源
-  Sources/              SwiftUI、蓝牙、HID、音频及动作执行
-GoogleRemote.xcodeproj/ Xcode macOS App 工程
-Tests/                  Swift Package Manager 测试
-scripts/                图标生成与签名安装脚本
-docs/                   公开的设备预设、HID 学习及品牌文档
-Package.swift           可独立测试的协议/映射核心
+  Assets.xcassets/       AppIcon、三态菜单栏图标与品牌资源
+  Sources/
+    Core/                纯领域模型、协议解码、状态机、存储与开机自启状态流转
+    Hardware/            HID 独占捕获、ATVV 蓝牙语音、虚拟声卡与 SMAppService 适配
+    Relay/               双机局域网发现、信任白名单与加密转发
+    Coordinator/         应用常驻运行时与唯一会话编排中枢
+    UI/                  设计系统、4 主导航工作台、权限体检与诊断页
+Drivers/MoteFlowMic/     自研纯输入型零回声虚拟麦克风 CoreAudio 驱动源码
+GoogleRemote.xcodeproj/  Xcode macOS App 工程
+Tests/                   Swift Package Manager 测试
+scripts/                 图标生成、虚拟麦克风安装与签名安装脚本
+docs/                    公开的设备预设、HID 学习及品牌文档
+Package.swift            可独立测试的纯核心层（ATVVCore）
 ```
 
 更多细节：
@@ -195,8 +202,8 @@ Package.swift           可独立测试的协议/映射核心
 - [x] 原生 macOS 控制台、图形化快捷键和动作库
 - [x] Google G9N9N HID 默认映射和 ATVV 接收代码
 - [x] 小米 RC001 / RC003 图示和设备预设隔离
-- [x] BlackHole 设备管理与 PCM 路由代码
-- [x] 菜单栏轻量模式
+- [x] BlackHole 设备管理、内置 `MoteFlowMic.driver` 虚拟麦克风与 PCM 路由
+- [x] 菜单栏轻量模式与 macOS 原生开机自启（`SMAppService`）
 - [ ] 小米遥控器 2 / 2 Pro 实体 HID 与语音通道验收
 - [x] Google 遥控器 → ATVV → BlackHole 2ch → 豆包语音输入单环境实测（2026-11-06）
 - [ ] 其他 Mac / macOS 版本、遥控器固件及第三方语音应用兼容性验收

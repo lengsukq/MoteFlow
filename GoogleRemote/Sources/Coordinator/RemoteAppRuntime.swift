@@ -15,8 +15,16 @@ final class RemoteAppRuntime: ObservableObject {
         }
     }
     @Published private(set) var mainWindowVisible = true
+    @Published private(set) var launchAtLoginStatus: LaunchAtLoginStatus
+    @Published private(set) var launchAtLoginErrorMessage: String?
+
+    var isLaunchAtLoginEnabled: Bool {
+        launchAtLoginStatus.isEnabled
+    }
 
     private static let preferenceKey = "GoogleRemote.lightweightModeEnabled.v1"
+    private let launchAtLoginService: LaunchAtLoginManaging
+    private var cancellables: Set<AnyCancellable> = []
     private weak var monitor: HIDCaptureManager?
     private weak var runner: RemoteActionRunner?
     private weak var bluetooth: RemoteBluetoothManager?
@@ -25,8 +33,72 @@ final class RemoteAppRuntime: ObservableObject {
     private var terminationObserver: NSObjectProtocol?
     private var handledInitialWindow = false
 
-    init() {
-        lightweightModeEnabled = UserDefaults.standard.bool(forKey: Self.preferenceKey)
+    init(launchAtLoginService: LaunchAtLoginManaging = SystemLaunchAtLoginService()) {
+        self.launchAtLoginService = launchAtLoginService
+        self.lightweightModeEnabled = UserDefaults.standard.bool(forKey: Self.preferenceKey)
+        self.launchAtLoginStatus = launchAtLoginService.currentStatus
+
+        // Keep Login Items status synced when the user toggles MoteFlow directly
+        // inside macOS System Settings and returns to the app or opens the menu bar.
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+            .merge(with: NotificationCenter.default.publisher(for: NSMenu.didBeginTrackingNotification))
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refreshLaunchAtLoginStatus()
+            }
+            .store(in: &cancellables)
+    }
+
+    func refreshLaunchAtLoginStatus() {
+        let latest = launchAtLoginService.currentStatus
+        if latest != launchAtLoginStatus {
+            launchAtLoginStatus = latest
+        }
+        if latest == .enabled {
+            launchAtLoginErrorMessage = nil
+        }
+    }
+
+    func setLaunchAtLoginEnabled(_ enabled: Bool, announceHUD: Bool = false) {
+        let result = LaunchAtLoginController.apply(
+            desiredEnabled: enabled,
+            service: launchAtLoginService
+        )
+        launchAtLoginStatus = result.status
+        launchAtLoginErrorMessage = result.errorMessage
+        if result.shouldOpenSystemSettings {
+            launchAtLoginService.openSystemSettings()
+        }
+        guard announceHUD else { return }
+
+        if let errorMessage = result.errorMessage {
+            RemoteSwitchHUDController.shared.show(
+                title: result.status.needsSystemSettingsApproval ? "需在系统设置允许开机自启" : "开机自启设置未生效",
+                subtitle: errorMessage,
+                symbol: "exclamationmark.triangle.fill",
+                tint: RemotePalette.amber
+            )
+        } else if result.status.isEnabled {
+            RemoteSwitchHUDController.shared.show(
+                title: "已开启开机自动启动",
+                subtitle: lightweightModeEnabled
+                    ? "下次登录 macOS 将自动静默常驻菜单栏"
+                    : "下次登录 macOS 将自动启动 MoteFlow",
+                symbol: "power.circle.fill",
+                tint: RemotePalette.positive
+            )
+        } else {
+            RemoteSwitchHUDController.shared.show(
+                title: "已关闭开机自动启动",
+                subtitle: "已从 macOS 登录项中移除 MoteFlow",
+                symbol: "power.circle",
+                tint: RemotePalette.indigo
+            )
+        }
+    }
+
+    func openLoginItemsSettings() {
+        launchAtLoginService.openSystemSettings()
     }
 
     func startKeepingRemoteAlive(
